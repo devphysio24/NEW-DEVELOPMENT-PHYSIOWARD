@@ -1,0 +1,275 @@
+/* Loading Container */
+.loading-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 200px;
+  padding: 40px 20px;
+  /* Performance: isolate rendering */
+  contain: layout style paint;
+}
+
+.loading-container.fullscreen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* Use solid color for better performance, gradient only when necessary */
+  background: radial-gradient(
+    circle at top left,
+    #fff9a3 0%,
+    #e8ffb5 25%,
+    #baf8ff 55%,
+    #d8c8ff 85%,
+    #ffffff 100%
+  );
+  z-index: 9999;
+  min-height: 100vh;
+  /* Performance: create stacking context */
+  isolation: isolate;
+  /* Performance: optimize compositing */
+  transform: translateZ(0);
+  will-change: contents;
+}
+
+.loading-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  /* Performance: isolate this layer */
+  contain: layout style paint;
+}
+
+/* Logo Loader */
+.logo-loader {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Performance: isolate rendering */
+  contain: layout style paint;
+  /* Performance: hint browser about transforms */
+  will-change: transform;
+}
+
+.logo-loader.small {
+  width: 120px;
+  height: 50px;
+}
+
+.logo-loader.medium {
+  width: 200px;
+  height: 85px;
+}
+
+.logo-loader.large {
+  width: 300px;
+  height: 130px;
+}
+
+.logo-svg {
+  width: 100%;
+  height: 100%;
+  /* Performance: force GPU acceleration */
+  transform: translate3d(0, 0, 0);
+  /* Performance: prevent flickering */
+  backface-visibility: hidden;
+  /* Performance: hint browser */
+  will-change: transform;
+  /* Use simpler shadow - filter is expensive */
+  filter: drop-shadow(0 2px 4px rgba(0, 63, 83, 0.1));
+  animation: logoFloat 3s ease-in-out infinite;
+}
+
+/* Logo Animation - Floating Effect - Optimized */
+@keyframes logoFloat {
+  0%, 100% {
+    /* Use translate3d for GPU acceleration */
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: translate3d(0, -10px, 0) scale(1.02);
+    opacity: 0.95;
+  }
+}
+
+/* Blue Parts Pulse Animation - Optimized (opacity only, no fill change) */
+.logo-part-blue {
+  /* Performance: only animate opacity (GPU-accelerated), not fill (causes repaint) */
+  animation: colorPulse 2s ease-in-out infinite;
+  will-change: opacity;
+}
+
+@keyframes colorPulse {
+  0%, 100% {
+    opacity: 1;
+    /* Don't animate fill - it causes repaint */
+  }
+  50% {
+    opacity: 0.75;
+  }
+}
+
+/* Loading Dots - Optimized */
+.loading-dots {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  /* Performance: isolate rendering */
+  contain: layout style paint;
+}
+
+.loading-dots span {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #003f53;
+  /* Performance: force GPU acceleration */
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
+  will-change: transform, opacity;
+  animation: dotBounce 1.4s ease-in-out infinite both;
+}
+
+.loading-dots span:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.loading-dots span:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+.loading-dots span:nth-child(3) {
+  animation-delay: 0;
+}
+
+@keyframes dotBounce {
+  0%, 80%, 100% {
+    /* Use scale3d for GPU acceleration */
+    transform: translate3d(0, 0, 0) scale3d(0.8, 0.8, 1);
+    opacity: 0.5;
+  }
+  40% {
+    transform: translate3d(0, 0, 0) scale3d(1.2, 1.2, 1);
+    opacity: 1;
+  }
+}
+
+/* Loading Message - Optimized */
+.loading-message {
+  font-size: 14px;
+  color: #64748B;
+  font-weight: 500;
+  margin: 0;
+  /* Performance: only animate opacity (GPU-accelerated) */
+  will-change: opacity;
+  animation: messageFade 2s ease-in-out infinite;
+}
+
+@keyframes messageFade {
+  0%, 100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .logo-loader.small {
+    width: 100px;
+    height: 42px;
+  }
+
+  .logo-loader.medium {
+    width: 160px;
+    height: 68px;
+  }
+
+  .logo-loader.large {
+    width: 240px;
+    height: 102px;
+  }
+
+  .loading-dots span {
+    width: 8px;
+    height: 8px;
+  }
+
+  .loading-message {
+    font-size: 13px;
+  }
+}
+
+/* Additional Animation for Logo Glow - Optimized */
+.logo-loader::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  /* Performance: use translate3d for GPU acceleration */
+  transform: translate3d(-50%, -50%, 0);
+  width: 120%;
+  height: 120%;
+  /* Simplified gradient for better performance */
+  background: radial-gradient(
+    circle,
+    rgba(144, 157, 196, 0.1) 0%,
+    transparent 70%
+  );
+  border-radius: 50%;
+  backface-visibility: hidden;
+  will-change: transform, opacity;
+  animation: glowPulse 2s ease-in-out infinite;
+  z-index: -1;
+  /* Performance: create new layer */
+  isolation: isolate;
+}
+
+@keyframes glowPulse {
+  0%, 100% {
+    opacity: 0.2;
+    transform: translate3d(-50%, -50%, 0) scale3d(1, 1, 1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: translate3d(-50%, -50%, 0) scale3d(1.05, 1.05, 1);
+  }
+}
+
+/* Performance: Reduce animations on low-end devices */
+@media (prefers-reduced-motion: reduce) {
+  .logo-svg,
+  .logo-part-blue,
+  .loading-dots span,
+  .loading-message,
+  .logo-loader::before {
+    animation: none !important;
+  }
+  
+  .logo-svg {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/* Performance: Throttle animations on slow devices */
+@media (max-width: 480px) {
+  .logo-svg {
+    animation-duration: 4s;
+  }
+  
+  .logo-part-blue {
+    animation-duration: 3s;
+  }
+  
+  .logo-loader::before {
+    animation-duration: 3s;
+  }
+}
+

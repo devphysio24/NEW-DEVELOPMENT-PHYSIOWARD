@@ -1,0 +1,464 @@
+.checkin-records-page {
+  min-height: calc(100vh - 64px);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+}
+
+/* Header Styles */
+.checkin-records-header {
+  padding: 24px 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.checkin-records-header-left {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.checkin-records-title {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 700;
+  color: #1a1a1a;
+  letter-spacing: -0.5px;
+}
+
+.checkin-records-subtitle {
+  margin: 0;
+  font-size: 14px;
+  color: #6b7280;
+  font-weight: 500;
+}
+
+.checkin-records-main {
+  width: 100%;
+}
+
+.checkin-records-container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* Check-In Records Card */
+.checkin-records-card {
+  background: white;
+  border-radius: 12px;
+  border: 1px solid #e5e5e5;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.checkin-records-loading,
+.checkin-records-empty {
+  padding: 40px;
+  text-align: center;
+  color: #6b7280;
+  font-size: 14px;
+}
+
+/* Table Styles */
+.checkin-records-table {
+  width: 100%;
+}
+
+.checkin-records-header-row {
+  display: grid;
+  grid-template-columns: 2fr 1.5fr 1.5fr 1.5fr 120px;
+  gap: 16px;
+  padding: 16px 28px;
+  background: #fafafa;
+  border-bottom: 1px solid #e5e5e5;
+  font-size: 11px;
+  font-weight: 600;
+  color: #737373;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.checkin-records-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.checkin-records-row {
+  display: grid;
+  grid-template-columns: 2fr 1.5fr 1.5fr 1.5fr 120px;
+  gap: 16px;
+  padding: 16px 28px;
+  border-bottom: 1px solid #f5f5f5;
+  transition: all 0.12s ease;
+  align-items: center;
+}
+
+.checkin-records-row:hover {
+  background: #fafafa;
+}
+
+.checkin-records-row:last-child {
+  border-bottom: none;
+}
+
+.checkin-records-col-date,
+.checkin-records-col-time,
+.checkin-records-col-status,
+.checkin-records-col-shift,
+.checkin-records-col-action {
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  color: #0d0d0d;
+}
+
+.checkin-records-col-action {
+  justify-content: flex-end;
+}
+
+/* Status Badge */
+.checkin-status-badge {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid transparent;
+}
+
+.checkin-status-badge.checkin-status-green {
+  background: #d1fae5;
+  color: #065f46;
+  border-color: #a7f3d0;
+}
+
+.checkin-status-badge.checkin-status-yellow {
+  background: #fef3c7;
+  color: #92400e;
+  border-color: #fde68a;
+}
+
+.checkin-status-badge.checkin-status-red {
+  background: #fee2e2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+
+/* View Button */
+.checkin-view-btn {
+  padding: 6px 16px;
+  background: #0d0d0d;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  white-space: nowrap;
+}
+
+.checkin-view-btn:hover {
+  background: #262626;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.checkin-view-btn:active {
+  transform: translateY(0);
+}
+
+/* Pagination */
+.checkin-records-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 20px 28px;
+  border-top: 1px solid #e5e5e5;
+  background: #fafafa;
+}
+
+.checkin-pagination-btn {
+  padding: 6px 14px;
+  background: white;
+  border: 1px solid #e5e5e5;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: #525252;
+  transition: all 0.12s ease;
+}
+
+.checkin-pagination-btn:hover:not(:disabled) {
+  background: #fafafa;
+  border-color: #d4d4d4;
+  color: #262626;
+}
+
+.checkin-pagination-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.checkin-pagination-info {
+  font-size: 13px;
+  color: #737373;
+  font-weight: 500;
+}
+
+/* Record Details Modal */
+.checkin-record-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 20px;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.checkin-record-modal-content {
+  background: white;
+  border-radius: 12px;
+  max-width: 600px;
+  width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  border: 1px solid #e5e5e5;
+  animation: slideUp 0.2s ease;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.checkin-record-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid #f5f5f5;
+}
+
+.checkin-record-modal-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #0d0d0d;
+  letter-spacing: -0.3px;
+}
+
+.checkin-record-modal-close {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: #f5f5f5;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 20px;
+  color: #737373;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.12s ease;
+  line-height: 1;
+}
+
+.checkin-record-modal-close:hover {
+  background: #e5e5e5;
+  color: #262626;
+}
+
+.checkin-record-modal-body {
+  padding: 24px;
+}
+
+.checkin-record-detail-section {
+  margin-bottom: 24px;
+}
+
+.checkin-record-detail-section:last-child {
+  margin-bottom: 0;
+}
+
+.checkin-record-detail-section-title {
+  margin: 0 0 14px 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: #0d0d0d;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #f5f5f5;
+  letter-spacing: -0.2px;
+}
+
+.checkin-record-detail-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid #f5f5f5;
+}
+
+.checkin-record-detail-item:last-child {
+  border-bottom: none;
+}
+
+.checkin-record-detail-label {
+  font-size: 13px;
+  color: #737373;
+  font-weight: 500;
+}
+
+.checkin-record-detail-value {
+  font-size: 14px;
+  color: #0d0d0d;
+  font-weight: 500;
+}
+
+.checkin-record-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+
+.checkin-record-metric-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: #fafafa;
+  border-radius: 8px;
+  border: 1px solid #e5e5e5;
+}
+
+.checkin-record-metric-label {
+  font-size: 13px;
+  color: #737373;
+  font-weight: 500;
+}
+
+.checkin-record-metric-value {
+  font-size: 14px;
+  color: #0d0d0d;
+  font-weight: 600;
+}
+
+.checkin-record-notes {
+  margin: 0;
+  padding: 12px 16px;
+  background: #fafafa;
+  border-radius: 8px;
+  border: 1px solid #e5e5e5;
+  font-size: 14px;
+  color: #0d0d0d;
+  line-height: 1.6;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .checkin-records-header {
+    padding: 20px 24px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 16px;
+  }
+
+  .checkin-records-title {
+    font-size: 24px;
+  }
+
+  .checkin-records-main {
+    padding: 24px 20px;
+  }
+
+  .checkin-records-header-row,
+  .checkin-records-row {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .checkin-records-header-row {
+    display: none;
+  }
+
+  .checkin-records-row {
+    border-bottom: 1px solid #e5e5e5;
+    margin-bottom: 8px;
+    border-radius: 8px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  }
+
+  .checkin-records-col-date,
+  .checkin-records-col-time,
+  .checkin-records-col-status,
+  .checkin-records-col-shift,
+  .checkin-records-col-action {
+    padding: 4px 0;
+    font-size: 13px;
+  }
+
+  .checkin-records-col-action {
+    justify-content: flex-start;
+    padding-top: 8px;
+  }
+
+  .checkin-records-col-date::before {
+    content: 'Date: ';
+    font-weight: 600;
+    color: #737373;
+  }
+
+  .checkin-records-col-time::before {
+    content: 'Time: ';
+    font-weight: 600;
+    color: #737373;
+  }
+
+  .checkin-records-col-status::before {
+    content: 'Status: ';
+    font-weight: 600;
+    color: #737373;
+  }
+
+  .checkin-records-col-shift::before {
+    content: 'Shift: ';
+    font-weight: 600;
+    color: #737373;
+  }
+
+  .checkin-view-btn {
+    width: 100%;
+    padding: 8px 16px;
+  }
+
+  .checkin-record-metrics-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .checkin-record-modal-content {
+    margin: 12px;
+    max-width: calc(100% - 24px);
+  }
+}
+

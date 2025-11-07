@@ -1,0 +1,306 @@
+.daily-checkin {
+  min-height: 100vh;
+  background: #f9fafb;
+  padding: 0;
+}
+
+.checkin-header {
+  padding: 20px 24px;
+  background: white;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.checkin-back-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  color: #4b5563;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 8px 0;
+  transition: color 0.2s;
+}
+
+.checkin-back-btn:hover {
+  color: #111827;
+}
+
+.checkin-back-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.checkin-container {
+  max-width: 700px;
+  margin: 0 auto;
+  padding: 40px 24px;
+}
+
+.checkin-title-section {
+  text-align: center;
+  margin-bottom: 32px;
+}
+
+.checkin-title {
+  font-size: 32px;
+  font-weight: 700;
+  color: #111827;
+  margin: 0 0 8px 0;
+  letter-spacing: -0.5px;
+}
+
+.checkin-subtitle {
+  font-size: 16px;
+  color: #6b7280;
+  margin: 0;
+}
+
+.checkin-form-card {
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06);
+  padding: 32px;
+  margin-bottom: 24px;
+}
+
+.checkin-section {
+  margin-bottom: 32px;
+}
+
+.checkin-section-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #111827;
+  margin: 0 0 8px 0;
+}
+
+.checkin-instructions {
+  font-size: 14px;
+  color: #6b7280;
+  margin: 0 0 32px 0;
+}
+
+.checkin-slider-group {
+  margin-bottom: 32px;
+}
+
+.checkin-slider-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.checkin-slider-label {
+  font-size: 16px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.checkin-slider-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: #374151;
+}
+
+.checkin-slider-desc {
+  font-size: 14px;
+  color: #6b7280;
+  margin: 0 0 12px 0;
+}
+
+.checkin-slider-wrapper {
+  position: relative;
+  width: 100%;
+}
+
+.checkin-slider {
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+  background: linear-gradient(
+    to right,
+    var(--slider-color, #10b981) 0%,
+    var(--slider-color, #10b981) var(--slider-percentage, 0%),
+    #e5e7eb var(--slider-percentage, 0%),
+    #e5e7eb 100%
+  );
+}
+
+.checkin-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: white;
+  border: 3px solid var(--slider-color, #10b981);
+  cursor: pointer;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+}
+
+.checkin-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.checkin-slider::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: white;
+  border: 3px solid var(--slider-color, #10b981);
+  cursor: pointer;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+}
+
+.checkin-slider::-moz-range-thumb:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.checkin-textarea-group {
+  margin-top: 32px;
+}
+
+.checkin-textarea-label {
+  display: block;
+  font-size: 16px;
+  font-weight: 600;
+  color: #111827;
+  margin-bottom: 8px;
+}
+
+.checkin-textarea {
+  width: 100%;
+  padding: 12px 16px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  color: #111827;
+  resize: vertical;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.checkin-textarea:focus {
+  outline: none;
+  border-color: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.1);
+}
+
+.checkin-textarea.required-field {
+  border-color: #ef4444;
+  border-width: 2px;
+}
+
+.checkin-textarea.required-field:focus {
+  border-color: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
+}
+
+.checkin-textarea::placeholder {
+  color: #9ca3af;
+}
+
+.checkin-readiness-section {
+  background: #f9fafb;
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 24px;
+  text-align: center;
+}
+
+.checkin-readiness-label {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 12px;
+}
+
+.checkin-readiness-value {
+  font-size: 48px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.checkin-submit-btn {
+  width: 100%;
+  padding: 16px 24px;
+  background: #10b981;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s, transform 0.1s, box-shadow 0.2s;
+}
+
+.checkin-submit-btn:hover {
+  background: #059669;
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+}
+
+.checkin-submit-btn:active {
+  transform: scale(0.98);
+}
+
+/* Shift Info Card */
+.checkin-shift-info-card {
+  animation: fadeIn 0.3s ease-in;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+  transition: all 0.2s ease;
+}
+
+.checkin-shift-info-card:hover {
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.checkin-submit-btn:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.3);
+}
+
+/* Responsive Design */
+@media (max-width: 640px) {
+  .checkin-container {
+    padding: 24px 16px;
+  }
+
+  .checkin-title {
+    font-size: 28px;
+  }
+
+  .checkin-form-card {
+    padding: 24px;
+  }
+
+  .checkin-readiness-value {
+    font-size: 36px;
+  }
+}
+

@@ -1,0 +1,279 @@
+.profile-container {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.profile-header {
+  margin-bottom: 32px;
+}
+
+.profile-header h1 {
+  font-size: 28px;
+  font-weight: 700;
+  color: #0F172A;
+  margin: 0 0 8px 0;
+}
+
+.profile-subtitle {
+  font-size: 14px;
+  color: #64748B;
+  margin: 0;
+}
+
+.profile-content {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 12px;
+  padding: 32px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+
+.profile-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.profile-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: #FEF2F2;
+  border: 1px solid #FECACA;
+  border-radius: 8px;
+  color: #DC2626;
+  font-size: 14px;
+}
+
+.profile-success {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: #F0FDF4;
+  border: 1px solid #BBF7D0;
+  border-radius: 8px;
+  color: #16A34A;
+  font-size: 14px;
+}
+
+.profile-form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.profile-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: #0F172A;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.required {
+  color: #EF4444;
+}
+
+.profile-input {
+  padding: 12px 16px;
+  font-size: 14px;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  background: #FFFFFF;
+  color: #0F172A;
+  transition: all 0.15s ease;
+  font-family: inherit;
+}
+
+.profile-input:focus {
+  outline: none;
+  border-color: #3B82F6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.profile-input:disabled {
+  background: #F8FAFC;
+  color: #94A3B8;
+  cursor: not-allowed;
+}
+
+.profile-input::placeholder {
+  color: #94A3B8;
+}
+
+.profile-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 8px;
+}
+
+.profile-save-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  background: #3B82F6;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+}
+
+.profile-save-btn:hover:not(:disabled) {
+  background: #2563EB;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+}
+
+.profile-save-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.profile-save-btn:disabled {
+  background: #94A3B8;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.profile-save-btn svg {
+  flex-shrink: 0;
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.profile-password-section {
+  margin-top: 48px;
+  padding-top: 32px;
+  border-top: 1px solid #E2E8F0;
+}
+
+.profile-password-header {
+  margin-bottom: 24px;
+}
+
+.profile-password-header h2 {
+  font-size: 20px;
+  font-weight: 700;
+  color: #0F172A;
+  margin: 0 0 8px 0;
+}
+
+.profile-password-subtitle {
+  font-size: 14px;
+  color: #64748B;
+  margin: 0;
+}
+
+.profile-password-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.profile-input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.profile-input-wrapper .profile-input {
+  padding-right: 48px;
+}
+
+.profile-password-toggle {
+  position: absolute;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  color: #64748B;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.profile-password-toggle:hover:not(:disabled) {
+  background: #F8FAFC;
+  color: #0F172A;
+}
+
+.profile-password-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.profile-password-toggle svg {
+  width: 18px;
+  height: 18px;
+}
+
+.profile-input-hint {
+  font-size: 12px;
+  color: #94A3B8;
+  margin: 4px 0 0 0;
+}
+
+.profile-readonly-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: #64748B;
+  margin-left: 8px;
+  font-style: italic;
+}
+
+@media (max-width: 768px) {
+  .profile-container {
+    padding: 16px;
+  }
+
+  .profile-content {
+    padding: 24px;
+  }
+
+  .profile-header h1 {
+    font-size: 24px;
+  }
+
+  .profile-form-actions {
+    justify-content: stretch;
+  }
+
+  .profile-save-btn {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .profile-password-section {
+    margin-top: 32px;
+    padding-top: 24px;
+  }
+
+  .profile-password-header h2 {
+    font-size: 18px;
+  }
+}
+

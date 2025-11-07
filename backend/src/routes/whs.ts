@@ -1,0 +1,1391 @@
+import { Hono } from 'hono'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth'
+import { getCaseStatusFromNotes, mapCaseStatusToDisplay, CaseStatus } from '../utils/caseStatus'
+import { getAdminClient } from '../utils/adminClient'
+
+const whs = new Hono<{ Variables: AuthVariables }>()
+
+// Get all incidents/cases for WHS (from all supervisors)
+whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    // Support both cursor and offset-based pagination (backward compatible)
+    const cursor = c.req.query('cursor')
+    const page = c.req.query('page') ? parseInt(c.req.query('page')!) : undefined
+    const limit = Math.min(parseInt(c.req.query('limit') || '20'), 1000)
+    const useCursor = cursor !== undefined || page === undefined
+    
+    const status = c.req.query('status') || 'active' // Default to 'active' - show active cases first
+    const type = c.req.query('type') || 'all'
+    const search = c.req.query('search') || ''
+
+    // Validate pagination
+    if (limit < 1 || limit > 1000) {
+      return c.json({ error: 'Invalid pagination parameters. Limit must be between 1 and 1000' }, 400)
+    }
+    if (page !== undefined && (page < 1)) {
+      return c.json({ error: 'Invalid pagination parameters. Page must be >= 1' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // Only incident-worthy exception types
+    const incidentTypes = ['accident', 'injury', 'medical_leave', 'other']
+
+    let countQuery = adminClient
+      .from('worker_exceptions')
+      .select('*', { count: 'exact', head: true })
+      .in('exception_type', incidentTypes)
+      .eq('assigned_to_whs', true) // Only show incidents assigned by supervisor
+
+    let query = adminClient
+      .from('worker_exceptions')
+      .select(`
+        *,
+        users!worker_exceptions_user_id_fkey(
+          id,
+          email,
+          first_name,
+          last_name,
+          full_name
+        ),
+        teams!worker_exceptions_team_id_fkey(
+          id,
+          name,
+          site_location,
+          supervisor_id,
+          team_leader_id
+        ),
+        clinician:users!worker_exceptions_clinician_id_fkey(
+          id,
+          email,
+          first_name,
+          last_name,
+          full_name
+        )
+      `)
+      .in('exception_type', incidentTypes)
+      .eq('assigned_to_whs', true) // Only show incidents assigned by supervisor
+
+    // Filter by status - default to active if not specified
+    const todayStr = new Date().toISOString().split('T')[0]
+    const filterStatus = status || 'active' // Default to active
+    
+    if (filterStatus === 'active') {
+      query = query.eq('is_active', true).gte('start_date', todayStr).or(`end_date.is.null,end_date.gte.${todayStr}`)
+      countQuery = countQuery.eq('is_active', true).gte('start_date', todayStr).or(`end_date.is.null,end_date.gte.${todayStr}`)
+    } else if (filterStatus === 'closed') {
+      query = query.or(`end_date.lt.${todayStr},is_active.eq.false`)
+      countQuery = countQuery.or(`end_date.lt.${todayStr},is_active.eq.false`)
+    } else if (filterStatus === 'new') {
+      // New cases: created within last 7 days and still active
+      const weekAgo = new Date()
+      weekAgo.setDate(weekAgo.getDate() - 7)
+      query = query.eq('is_active', true).gte('created_at', weekAgo.toISOString())
+      countQuery = countQuery.eq('is_active', true).gte('created_at', weekAgo.toISOString())
+    }
+
+    // Filter by type
+    if (type !== 'all') {
+      query = query.eq('exception_type', type)
+      countQuery = countQuery.eq('exception_type', type)
+    }
+
+    // Get paginated cases using cursor or offset-based pagination
+    let cases: any[] = []
+    let casesError: any = null
+    let count: number | null = null
+    let hasMore = false
+    
+    if (useCursor) {
+      // Cursor-based pagination (more efficient for large datasets)
+      const { decodeCursor, encodeCursor } = await import('../utils/pagination')
+      
+      // Decode cursor if provided
+      let cursorFilter = query.order('created_at', { ascending: false })
+      if (cursor) {
+        const decoded = decodeCursor(cursor)
+        if (decoded) {
+          const cursorDate = decoded.createdAt || decoded.created_at
+          if (cursorDate) {
+            cursorFilter = cursorFilter.lt('created_at', cursorDate)
+          }
+        }
+      }
+      
+      // Fetch limit + 1 to check if there's more
+      const { data: casesData, error: casesErr } = await cursorFilter.limit(limit + 1)
+      
+      cases = casesData || []
+      casesError = casesErr
+      hasMore = cases.length > limit
+      
+      // Remove extra item if we got one
+      if (hasMore) {
+        cases = cases.slice(0, limit)
+      }
+    } else {
+      // Offset-based pagination (backward compatible)
+      const offset = ((page || 1) - 1) * limit
+      
+      // Get total count (run in parallel with main query for better performance)
+      const [countResult, casesResult] = await Promise.all([
+        countQuery,
+        query
+          .order('created_at', { ascending: false })
+          .range(offset, offset + limit - 1)
+      ])
+
+      const { count: totalCount, error: countError } = countResult
+      const { data: casesData, error: casesErr } = casesResult
+
+      if (countError) {
+        console.error('[GET /whs/cases] Error counting cases:', countError)
+        return c.json({ error: 'Failed to count cases', details: countError.message }, 500)
+      }
+
+      cases = casesData || []
+      casesError = casesErr
+      count = totalCount || 0
+    }
+
+    if (casesError) {
+      console.error('[GET /whs/cases] Error fetching cases:', casesError)
+      return c.json({ error: 'Failed to fetch cases', details: casesError.message }, 500)
+    }
+
+    // Get supervisor and team leader info for all unique IDs (optimized batch fetch)
+    const supervisorIds = Array.from(new Set(
+      (cases || [])
+        .map((incident: any) => {
+          const team = Array.isArray(incident.teams) ? incident.teams[0] : incident.teams
+          return team?.supervisor_id
+        })
+        .filter(Boolean)
+    ))
+
+    const teamLeaderIds = Array.from(new Set(
+      (cases || [])
+        .map((incident: any) => {
+          const team = Array.isArray(incident.teams) ? incident.teams[0] : incident.teams
+          return team?.team_leader_id
+        })
+        .filter(Boolean)
+    ))
+
+    // Batch fetch all users (supervisors and team leaders) in parallel
+    const allUserIds = Array.from(new Set([...supervisorIds, ...teamLeaderIds]))
+    let userMap = new Map()
+    if (allUserIds.length > 0) {
+      const { data: users } = await adminClient
+        .from('users')
+        .select('id, email, first_name, last_name, full_name')
+        .in('id', allUserIds)
+
+      if (users) {
+        users.forEach((user: any) => {
+          userMap.set(user.id, user)
+        })
+      }
+    }
+
+    // Format cases
+    const todayDate = new Date()
+    let formattedCases = (cases || []).map((incident: any) => {
+      const user = Array.isArray(incident.users) ? incident.users[0] : incident.users
+      const team = Array.isArray(incident.teams) ? incident.teams[0] : incident.teams
+      const supervisor = team?.supervisor_id ? userMap.get(team.supervisor_id) : null
+      const teamLeader = team?.team_leader_id ? userMap.get(team.team_leader_id) : null
+      const clinician = Array.isArray(incident.clinician) ? incident.clinician[0] : incident.clinician
+
+      const startDate = new Date(incident.start_date)
+      const endDate = incident.end_date ? new Date(incident.end_date) : null
+      const isCurrentlyActive = todayDate >= startDate && (!endDate || todayDate <= endDate) && incident.is_active
+
+      // OPTIMIZATION: Parse notes once and reuse for both case_status and approval info
+      let notesData: any = null
+      let caseStatusFromNotes: CaseStatus | null = null
+      let approvedBy: string | null = null
+      let approvedAt: string | null = null
+
+      if (incident.notes) {
+        try {
+          notesData = JSON.parse(incident.notes)
+          // Extract case_status using secure helper (validates status)
+          caseStatusFromNotes = getCaseStatusFromNotes(incident.notes)
+          // Extract approval information
+          if (notesData.approved_by) {
+            approvedBy = notesData.approved_by
+          }
+          if (notesData.approved_at) {
+            approvedAt = notesData.approved_at
+          }
+        } catch {
+          // Notes is not JSON, ignore - caseStatusFromNotes will remain null
+        }
+      }
+
+      // OPTIMIZATION: Calculate createdAt once and reuse for both status check and case number
+      const createdAt = new Date(incident.created_at)
+
+      // Determine case status - use notes if available, otherwise calculate
+      let caseStatus: string
+      if (caseStatusFromNotes) {
+        // Use centralized mapping for consistency and security
+        caseStatus = mapCaseStatusToDisplay(caseStatusFromNotes, false, isCurrentlyActive)
+      } else if (isCurrentlyActive) {
+        // Check if it's new (created within last 7 days)
+        const daysSinceCreation = Math.floor((todayDate.getTime() - createdAt.getTime()) / (1000 * 60 * 60 * 24))
+        caseStatus = daysSinceCreation <= 7 ? 'NEW CASE' : 'IN PROGRESS'
+      } else {
+        caseStatus = 'CLOSED'
+      }
+
+      // OPTIMIZATION: Generate case number using pre-calculated createdAt
+      const year = createdAt.getFullYear()
+      const month = String(createdAt.getMonth() + 1).padStart(2, '0')
+      const day = String(createdAt.getDate()).padStart(2, '0')
+      const hours = String(createdAt.getHours()).padStart(2, '0')
+      const minutes = String(createdAt.getMinutes()).padStart(2, '0')
+      const seconds = String(createdAt.getSeconds()).padStart(2, '0')
+      const uuidPrefix = incident.id.substring(0, 4).toUpperCase()
+      const caseNumber = `CASE-${year}${month}${day}-${hours}${minutes}${seconds}-${uuidPrefix}`
+
+      return {
+        id: incident.id,
+        caseNumber,
+        workerId: incident.user_id,
+        workerName: user?.full_name || 
+                   (user?.first_name && user?.last_name 
+                     ? `${user.first_name} ${user.last_name}`
+                     : user?.email || 'Unknown'),
+        workerEmail: user?.email || '',
+        teamId: incident.team_id,
+        teamName: team?.name || '',
+        siteLocation: team?.site_location || '',
+        supervisorId: team?.supervisor_id || null,
+        supervisorName: supervisor?.full_name ||
+                       (supervisor?.first_name && supervisor?.last_name
+                         ? `${supervisor.first_name} ${supervisor.last_name}`
+                         : supervisor?.email || 'Unknown'),
+        teamLeaderId: team?.team_leader_id || null,
+        teamLeaderName: teamLeader?.full_name ||
+                       (teamLeader?.first_name && teamLeader?.last_name
+                         ? `${teamLeader.first_name} ${teamLeader.last_name}`
+                         : teamLeader?.email || 'Unknown'),
+        clinicianId: incident.clinician_id || null,
+        clinicianName: clinician?.full_name ||
+                      (clinician?.first_name && clinician?.last_name
+                        ? `${clinician.first_name} ${clinician.last_name}`
+                        : clinician?.email || null),
+        type: incident.exception_type,
+        reason: incident.reason || '',
+        startDate: incident.start_date,
+        endDate: incident.end_date,
+        status: caseStatus,
+        severity: getSeverity(incident.exception_type),
+        isActive: isCurrentlyActive,
+        createdAt: incident.created_at,
+        updatedAt: incident.updated_at,
+        approvedBy,
+        approvedAt,
+      }
+    })
+
+    // Apply search filter
+    if (search.trim()) {
+      const searchLower = search.toLowerCase()
+      formattedCases = formattedCases.filter(caseItem => 
+        caseItem.workerName.toLowerCase().includes(searchLower) ||
+        caseItem.workerEmail.toLowerCase().includes(searchLower) ||
+        caseItem.caseNumber.toLowerCase().includes(searchLower) ||
+        caseItem.teamName.toLowerCase().includes(searchLower)
+      )
+    }
+
+    // Build pagination response
+    let paginationResponse: any
+    
+    if (useCursor) {
+      // Cursor-based pagination response
+      const { encodeCursor } = await import('../utils/pagination')
+      
+      let nextCursor: string | undefined = undefined
+      if (hasMore && formattedCases.length > 0) {
+        const lastItem = cases[cases.length - 1]
+        nextCursor = encodeCursor({
+          id: lastItem.id,
+          createdAt: lastItem.created_at,
+        })
+      }
+      
+      paginationResponse = {
+        limit,
+        hasNext: hasMore,
+        hasPrev: !!cursor,
+        nextCursor,
+        prevCursor: cursor || undefined,
+      }
+    } else {
+      // Offset-based pagination response (backward compatible)
+      const totalPages = Math.ceil((count || 0) / limit)
+      paginationResponse = {
+        page: page || 1,
+        limit,
+        total: count || 0,
+        totalPages,
+        hasNext: (page || 1) < totalPages,
+        hasPrev: (page || 1) > 1,
+      }
+    }
+
+    // Get summary statistics (only for assigned incidents)
+    const { data: allCases, error: summaryError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, exception_type, is_active, start_date, end_date, created_at')
+      .in('exception_type', incidentTypes)
+      .eq('assigned_to_whs', true) // Only count incidents assigned by supervisor
+
+    if (summaryError) {
+      console.error('[GET /whs/cases] Error fetching summary:', summaryError)
+    }
+
+    const todayDateObj = new Date()
+    const startOfMonth = new Date(todayDateObj.getFullYear(), todayDateObj.getMonth(), 1)
+    const weekAgo = new Date()
+    weekAgo.setDate(weekAgo.getDate() - 7)
+
+    const summary = {
+      total: allCases?.length || 0,
+      new: 0,
+      active: 0,
+      completed: 0,
+      byType: {} as Record<string, number>,
+    }
+
+    ;(allCases || []).forEach((caseItem: any) => {
+      // Count by type
+      const typeKey = caseItem.exception_type || 'other'
+      summary.byType[typeKey] = (summary.byType[typeKey] || 0) + 1
+
+      // Check status
+      const startDate = new Date(caseItem.start_date)
+      const endDate = caseItem.end_date ? new Date(caseItem.end_date) : null
+      const isCurrentlyActive = todayDateObj >= startDate && (!endDate || todayDateObj <= endDate) && caseItem.is_active
+      
+      if (isCurrentlyActive) {
+        const createdAt = new Date(caseItem.created_at)
+        if (createdAt >= weekAgo) {
+          summary.new++
+        }
+        summary.active++
+      } else {
+        summary.completed++
+      }
+    })
+
+    return c.json({
+      cases: formattedCases,
+      summary,
+      pagination: paginationResponse,
+    }, 200, {
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    })
+  } catch (error: any) {
+    console.error('[GET /whs/cases] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Helper function to determine severity
+function getSeverity(type: string): string {
+  const severityMap: Record<string, string> = {
+    injury: 'HIGH',
+    accident: 'HIGH',
+    medical_leave: 'MEDIUM',
+    other: 'LOW',
+  }
+  return severityMap[type] || 'LOW'
+}
+
+// Get notifications for WHS user
+whs.get('/notifications', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const limit = Math.min(parseInt(c.req.query('limit') || '50'), 200) // Max 200 notifications
+    const unreadOnly = c.req.query('unread_only') === 'true'
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Only fetch notifications belonging to the authenticated user
+    let query = adminClient
+      .from('notifications')
+      .select('*')
+      .eq('user_id', user.id) // Critical: RLS + explicit user_id check for defense in depth
+      .order('created_at', { ascending: false })
+      .limit(limit)
+
+    if (unreadOnly) {
+      query = query.eq('is_read', false)
+    }
+
+    const { data: notifications, error } = await query
+
+    if (error) {
+      console.error('[GET /whs/notifications] Error:', error)
+      return c.json({ error: 'Failed to fetch notifications', details: error.message }, 500)
+    }
+
+    // SECURITY: Only count unread notifications belonging to the authenticated user
+    const { count: unreadCount, error: countError } = await adminClient
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', user.id) // Critical: Only count user's own notifications
+      .eq('is_read', false)
+
+    if (countError) {
+      console.error('[GET /whs/notifications] Error counting unread:', countError)
+    }
+
+    return c.json({
+      notifications: notifications || [],
+      unreadCount: unreadCount || 0,
+    })
+  } catch (error: any) {
+    console.error('[GET /whs/notifications] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Mark notification as read
+whs.patch('/notifications/:notificationId/read', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const notificationId = c.req.param('notificationId')
+    const adminClient = getAdminClient()
+
+    // Verify notification belongs to user
+    const { data: notification, error: fetchError } = await adminClient
+      .from('notifications')
+      .select('id, user_id, is_read')
+      .eq('id', notificationId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (fetchError || !notification) {
+      return c.json({ error: 'Notification not found' }, 404)
+    }
+
+    if (notification.is_read) {
+      return c.json({ message: 'Notification already read' })
+    }
+
+    // SECURITY: Mark as read - verify user_id again in update (defense in depth)
+    const { data: updated, error: updateError } = await adminClient
+      .from('notifications')
+      .update({
+        is_read: true,
+        read_at: new Date().toISOString(),
+      })
+      .eq('id', notificationId)
+      .eq('user_id', user.id) // Critical: Double-check user ownership in update
+      .select()
+      .single()
+
+    if (updateError) {
+      console.error('[PATCH /whs/notifications/:id/read] Error:', updateError)
+      return c.json({ error: 'Failed to mark notification as read', details: updateError.message }, 500)
+    }
+
+    return c.json({ notification: updated })
+  } catch (error: any) {
+    console.error('[PATCH /whs/notifications/:id/read] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Mark all notifications as read
+whs.patch('/notifications/read-all', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Only update notifications belonging to the authenticated user
+    const { data: updated, error: updateError } = await adminClient
+      .from('notifications')
+      .update({
+        is_read: true,
+        read_at: new Date().toISOString(),
+      })
+      .eq('user_id', user.id) // Critical: Only mark user's own notifications as read
+      .eq('is_read', false)
+      .select()
+
+    if (updateError) {
+      console.error('[PATCH /whs/notifications/read-all] Error:', updateError)
+      return c.json({ error: 'Failed to mark notifications as read', details: updateError.message }, 500)
+    }
+
+    return c.json({ 
+      message: 'All notifications marked as read',
+      count: updated?.length || 0,
+    })
+  } catch (error: any) {
+    console.error('[PATCH /whs/notifications/read-all] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get all clinicians (for assignment dropdown)
+whs.get('/clinicians', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+
+    const { data: clinicians, error } = await adminClient
+      .from('users')
+      .select('id, email, first_name, last_name, full_name')
+      .eq('role', 'clinician')
+      .order('full_name', { ascending: true, nullsFirst: false })
+
+    if (error) {
+      console.error('[GET /whs/clinicians] Error:', error)
+      return c.json({ error: 'Failed to fetch clinicians', details: error.message }, 500)
+    }
+
+    const formattedClinicians = (clinicians || []).map((clinician: any) => ({
+      id: clinician.id,
+      email: clinician.email,
+      name: clinician.full_name || 
+            (clinician.first_name && clinician.last_name 
+              ? `${clinician.first_name} ${clinician.last_name}`
+              : clinician.email),
+    }))
+
+    return c.json({ clinicians: formattedClinicians })
+  } catch (error: any) {
+    console.error('[GET /whs/clinicians] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Assign case to clinician
+whs.post('/cases/:caseId/assign-clinician', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const caseId = c.req.param('caseId')
+    const { clinician_id } = await c.req.json()
+
+    if (!clinician_id) {
+      return c.json({ error: 'clinician_id is required' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // Verify case exists and is assigned to WHS
+    const { data: caseItem, error: caseError } = await adminClient
+      .from('worker_exceptions')
+      .select(`
+        *,
+        users!worker_exceptions_user_id_fkey(
+          id,
+          email,
+          first_name,
+          last_name,
+          full_name
+        ),
+        teams!worker_exceptions_team_id_fkey(
+          id,
+          name,
+          site_location
+        )
+      `)
+      .eq('id', caseId)
+      .eq('assigned_to_whs', true)
+      .single()
+
+    if (caseError || !caseItem) {
+      return c.json({ error: 'Case not found or not assigned to WHS' }, 404)
+    }
+
+    // Verify clinician exists and is actually a clinician
+    const { data: clinician, error: clinicianError } = await adminClient
+      .from('users')
+      .select('id, email, first_name, last_name, full_name, role')
+      .eq('id', clinician_id)
+      .eq('role', 'clinician')
+      .single()
+
+    if (clinicianError || !clinician) {
+      return c.json({ error: 'Clinician not found' }, 404)
+    }
+
+    // Update case with clinician assignment
+    const { data: updatedCase, error: updateError } = await adminClient
+      .from('worker_exceptions')
+      .update({ clinician_id })
+      .eq('id', caseId)
+      .select()
+      .single()
+
+    if (updateError) {
+      console.error('[POST /whs/cases/:caseId/assign-clinician] Error:', updateError)
+      return c.json({ error: 'Failed to assign case to clinician', details: updateError.message }, 500)
+    }
+
+    // Generate case number for notification
+    const createdAt = new Date(caseItem.created_at)
+    const year = createdAt.getFullYear()
+    const month = String(createdAt.getMonth() + 1).padStart(2, '0')
+    const day = String(createdAt.getDate()).padStart(2, '0')
+    const hours = String(createdAt.getHours()).padStart(2, '0')
+    const minutes = String(createdAt.getMinutes()).padStart(2, '0')
+    const seconds = String(createdAt.getSeconds()).padStart(2, '0')
+    const uuidPrefix = caseItem.id.substring(0, 4).toUpperCase()
+    const caseNumber = `CASE-${year}${month}${day}-${hours}${minutes}${seconds}-${uuidPrefix}`
+
+    const worker = Array.isArray(caseItem.users) ? caseItem.users[0] : caseItem.users
+    const workerName = worker?.full_name || 
+                     (worker?.first_name && worker?.last_name 
+                       ? `${worker.first_name} ${worker.last_name}`
+                       : worker?.email || 'Unknown')
+
+    // Create notification for clinician
+    const notification = {
+      user_id: clinician_id,
+      type: 'case_assigned_to_clinician',
+      title: '📋 New Case Assigned',
+      message: `A case (${caseNumber}) has been assigned to you. Worker: ${workerName}.`,
+      data: {
+        case_id: caseId,
+        case_number: caseNumber,
+        worker_id: caseItem.user_id,
+        worker_name: workerName,
+        worker_email: worker?.email || '',
+        exception_type: caseItem.exception_type,
+        reason: caseItem.reason || '',
+        start_date: caseItem.start_date,
+        end_date: caseItem.end_date,
+        assigned_by: user.id,
+        assigned_by_name: user.email || 'WHS Control Center',
+      },
+      is_read: false,
+    }
+
+    const { error: notifyError } = await adminClient
+      .from('notifications')
+      .insert([notification])
+
+    if (notifyError) {
+      console.error('[POST /whs/cases/:caseId/assign-clinician] Error creating notification:', notifyError)
+      // Don't fail the assignment if notification fails
+    } else {
+      console.log(`[POST /whs/cases/:caseId/assign-clinician] Notification sent to clinician ${clinician_id} for case ${caseId}`)
+    }
+
+    return c.json({ 
+      message: 'Case assigned to clinician successfully',
+      case: updatedCase,
+      clinician: {
+        id: clinician.id,
+        name: clinician.full_name || 
+              (clinician.first_name && clinician.last_name 
+                ? `${clinician.first_name} ${clinician.last_name}`
+                : clinician.email),
+      },
+    })
+  } catch (error: any) {
+    console.error('[POST /whs/cases/:caseId/assign-clinician] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get WHS Analytics data
+whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const range = c.req.query('range') || 'month' // week, month, year
+    const adminClient = getAdminClient()
+
+    // Only incident-worthy exception types
+    const incidentTypes = ['accident', 'injury', 'medical_leave', 'other']
+
+    // Get all cases assigned to WHS with team and supervisor info
+    const { data: allCases, error: casesError } = await adminClient
+      .from('worker_exceptions')
+      .select(`
+        id, 
+        exception_type, 
+        is_active, 
+        start_date, 
+        end_date, 
+        created_at, 
+        clinician_id, 
+        notes, 
+        assigned_to_whs,
+        team_id,
+        teams!worker_exceptions_team_id_fkey(
+          id,
+          supervisor_id,
+          name,
+          site_location
+        )
+      `)
+      .in('exception_type', incidentTypes)
+      .eq('assigned_to_whs', true)
+
+    if (casesError) {
+      console.error('[GET /whs/analytics] Error fetching cases:', casesError)
+      return c.json({ error: 'Failed to fetch analytics data', details: casesError.message }, 500)
+    }
+
+    const cases = allCases || []
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+
+    // Calculate date ranges
+    let startDate: Date
+    
+    if (range === 'week') {
+      startDate = new Date(today)
+      startDate.setDate(startDate.getDate() - 7)
+    } else if (range === 'year') {
+      startDate = new Date(today.getFullYear(), 0, 1)
+    } else {
+      // month (default)
+      startDate = new Date(today.getFullYear(), today.getMonth(), 1)
+    }
+
+    // Filter cases within range
+    const rangeCases = cases.filter((caseItem: any) => {
+      const createdAt = new Date(caseItem.created_at)
+      return createdAt >= startDate
+    })
+
+    // Calculate summary metrics
+    const totalCases = cases.length
+    const activeCases = cases.filter((c: any) => {
+      const start = new Date(c.start_date)
+      const end = c.end_date ? new Date(c.end_date) : null
+      return c.is_active && today >= start && (!end || today <= end)
+    }).length
+
+    const newCases = rangeCases.length
+
+    // Calculate average resolution time (for closed cases)
+    const closedCases = cases.filter((c: any) => {
+      const end = c.end_date ? new Date(c.end_date) : null
+      return !c.is_active || (end && end < today)
+    })
+
+    let avgResolutionTime = 0
+    if (closedCases.length > 0) {
+      const totalDays = closedCases.reduce((sum: number, c: any) => {
+        const start = new Date(c.start_date)
+        const end = c.end_date ? new Date(c.end_date) : new Date()
+        const days = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24))
+        return sum + days
+      }, 0)
+      avgResolutionTime = totalDays / closedCases.length
+    }
+
+    // Success rate (closed vs total)
+    const successRate = totalCases > 0 ? Math.round((closedCases.length / totalCases) * 100) : 0
+
+    // Clinician assignment rate
+    const casesWithClinician = cases.filter((c: any) => c.clinician_id).length
+    const clinicianAssignment = totalCases > 0 ? Math.round((casesWithClinician / totalCases) * 100) : 0
+
+    // Closed this period
+    const closedThisPeriod = rangeCases.filter((c: any) => {
+      const end = c.end_date ? new Date(c.end_date) : null
+      return (!c.is_active || (end && end >= startDate && end <= today))
+    }).length
+
+    // Upcoming deadlines (cases ending in next 7 days)
+    const sevenDaysFromNow = new Date(today)
+    sevenDaysFromNow.setDate(sevenDaysFromNow.getDate() + 7)
+    const upcomingDeadlines = cases.filter((c: any) => {
+      if (!c.end_date) return false
+      const end = new Date(c.end_date)
+      return end >= today && end <= sevenDaysFromNow && c.is_active
+    }).length
+
+    // Overdue tasks (cases past end date but still active)
+    const overdueTasks = cases.filter((c: any) => {
+      if (!c.end_date || !c.is_active) return false
+      const end = new Date(c.end_date)
+      return end < today
+    }).length
+
+    // Get case statuses from notes
+    const getStatusFromNotes = (notes: string | null): string => {
+      if (!notes) return 'open'
+      try {
+        const notesData = JSON.parse(notes)
+        const status = notesData.case_status
+        if (['new', 'triaged', 'assessed', 'in_rehab', 'return_to_work', 'closed'].includes(status)) {
+          return status
+        }
+      } catch {
+        // Not JSON, ignore
+      }
+      return 'open'
+    }
+
+    // Cases by status
+    const casesByStatus = {
+      open: 0,
+      triaged: 0,
+      assessed: 0,
+      inRehab: 0,
+      closed: 0,
+      returnToWork: 0,
+    }
+
+    cases.forEach((c: any) => {
+      const status = getStatusFromNotes(c.notes)
+      if (status === 'new' || status === 'open') {
+        casesByStatus.open++
+      } else if (status === 'triaged') {
+        casesByStatus.triaged++
+      } else if (status === 'assessed') {
+        casesByStatus.assessed++
+      } else if (status === 'in_rehab') {
+        casesByStatus.inRehab++
+      } else if (status === 'closed') {
+        casesByStatus.closed++
+      } else if (status === 'return_to_work') {
+        casesByStatus.returnToWork++
+      } else {
+        casesByStatus.open++
+      }
+    })
+
+    // Case trends over time
+    const caseTrends: Array<{ period: string; newCases: number; closedCases: number; activeCases: number }> = []
+    
+    if (range === 'week') {
+      // Daily for week (last 7 days)
+      for (let i = 6; i >= 0; i--) {
+        const date = new Date(today)
+        date.setDate(date.getDate() - i)
+        date.setHours(0, 0, 0, 0)
+        const dateEnd = new Date(date)
+        dateEnd.setHours(23, 59, 59, 999)
+        const dateStr = date.toLocaleDateString('en-US', { weekday: 'short' })
+        
+        // New cases created on this day
+        const dayCases = cases.filter((c: any) => {
+          const created = new Date(c.created_at)
+          created.setHours(0, 0, 0, 0)
+          return created.getTime() === date.getTime()
+        }).length
+        
+        // Closed cases on this day
+        const dayClosed = cases.filter((c: any) => {
+          if (!c.end_date) return false
+          const end = new Date(c.end_date)
+          end.setHours(0, 0, 0, 0)
+          return end.getTime() === date.getTime()
+        }).length
+        
+        // Active cases on this day
+        const dayActive = cases.filter((c: any) => {
+          const start = new Date(c.start_date)
+          start.setHours(0, 0, 0, 0)
+          const end = c.end_date ? new Date(c.end_date) : null
+          if (end) end.setHours(0, 0, 0, 0)
+          return c.is_active && date >= start && (!end || date <= end)
+        }).length
+
+        caseTrends.push({
+          period: dateStr,
+          newCases: dayCases,
+          closedCases: dayClosed,
+          activeCases: dayActive,
+        })
+      }
+    } else if (range === 'month') {
+      // Weekly for month (current month)
+      const monthEnd = new Date(today.getFullYear(), today.getMonth() + 1, 0)
+      monthEnd.setHours(23, 59, 59, 999)
+      
+      // Calculate weeks in the month
+      const firstDayOfMonth = new Date(today.getFullYear(), today.getMonth(), 1)
+      const lastDayOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0)
+      const daysInMonth = lastDayOfMonth.getDate()
+      const weeksInMonth = Math.ceil(daysInMonth / 7)
+      
+      for (let i = 0; i < weeksInMonth; i++) {
+        const weekStart = new Date(firstDayOfMonth)
+        weekStart.setDate(firstDayOfMonth.getDate() + (i * 7))
+        weekStart.setHours(0, 0, 0, 0)
+        const weekEnd = new Date(weekStart)
+        weekEnd.setDate(weekStart.getDate() + 6)
+        weekEnd.setHours(23, 59, 59, 999)
+        
+        // Don't show future weeks
+        if (weekStart > today) break
+        
+        // New cases created in this week
+        const weekCases = cases.filter((c: any) => {
+          const created = new Date(c.created_at)
+          return created >= weekStart && created <= weekEnd
+        }).length
+        
+        // Closed cases in this week
+        const weekClosed = cases.filter((c: any) => {
+          if (!c.end_date) return false
+          const end = new Date(c.end_date)
+          return end >= weekStart && end <= weekEnd
+        }).length
+        
+        // Active cases at the end of this week
+        const weekActive = cases.filter((c: any) => {
+          const start = new Date(c.start_date)
+          const end = c.end_date ? new Date(c.end_date) : null
+          return c.is_active && weekEnd >= start && (!end || weekEnd <= end)
+        }).length
+
+        caseTrends.push({
+          period: `Week ${i + 1}`,
+          newCases: weekCases,
+          closedCases: weekClosed,
+          activeCases: weekActive,
+        })
+      }
+    } else {
+      // Monthly for year (current year)
+      for (let i = 0; i < 12; i++) {
+        const monthStart = new Date(today.getFullYear(), i, 1)
+        monthStart.setHours(0, 0, 0, 0)
+        const monthEnd = new Date(today.getFullYear(), i + 1, 0)
+        monthEnd.setHours(23, 59, 59, 999)
+        
+        // Don't show future months
+        if (monthStart > today) break
+        
+        // New cases created in this month
+        const monthCases = cases.filter((c: any) => {
+          const created = new Date(c.created_at)
+          return created >= monthStart && created <= monthEnd
+        }).length
+        
+        // Closed cases in this month
+        const monthClosed = cases.filter((c: any) => {
+          if (!c.end_date) return false
+          const end = new Date(c.end_date)
+          return end >= monthStart && end <= monthEnd
+        }).length
+        
+        // Active cases at the end of this month
+        const monthActive = cases.filter((c: any) => {
+          const start = new Date(c.start_date)
+          const end = c.end_date ? new Date(c.end_date) : null
+          return c.is_active && monthEnd >= start && (!end || monthEnd <= end)
+        }).length
+
+        caseTrends.push({
+          period: monthStart.toLocaleDateString('en-US', { month: 'short' }),
+          newCases: monthCases,
+          closedCases: monthClosed,
+          activeCases: monthActive,
+        })
+      }
+    }
+
+    // Calculate supervisor statistics (cases per supervisor)
+    const supervisorStatsMap = new Map<string, { supervisorId: string; cases: any[]; teamIds: Set<string>; teamLeaderIds: Set<string> }>()
+    
+    cases.forEach((caseItem: any) => {
+      const team = Array.isArray(caseItem.teams) ? caseItem.teams[0] : caseItem.teams
+      if (team && team.supervisor_id) {
+        if (!supervisorStatsMap.has(team.supervisor_id)) {
+          supervisorStatsMap.set(team.supervisor_id, {
+            supervisorId: team.supervisor_id,
+            cases: [],
+            teamIds: new Set(),
+            teamLeaderIds: new Set(),
+          })
+        }
+        const stats = supervisorStatsMap.get(team.supervisor_id)!
+        stats.cases.push(caseItem)
+        if (team.id) {
+          stats.teamIds.add(team.id)
+        }
+        // Track team leader IDs (from team_leader_id field)
+        if (team.team_leader_id) {
+          stats.teamLeaderIds.add(team.team_leader_id)
+        }
+      }
+    })
+
+    // OPTIMIZATION: Get all teams for supervisors to count team leaders accurately
+    // (in case some teams don't have cases yet)
+    const supervisorIds = Array.from(supervisorStatsMap.keys())
+    if (supervisorIds.length > 0) {
+      const { data: allTeams } = await adminClient
+        .from('teams')
+        .select('id, supervisor_id, team_leader_id')
+        .in('supervisor_id', supervisorIds)
+
+      if (allTeams) {
+        allTeams.forEach((team: any) => {
+          if (team.supervisor_id && supervisorStatsMap.has(team.supervisor_id)) {
+            const stats = supervisorStatsMap.get(team.supervisor_id)!
+            if (team.id) {
+              stats.teamIds.add(team.id)
+            }
+            if (team.team_leader_id) {
+              stats.teamLeaderIds.add(team.team_leader_id)
+            }
+          }
+        })
+      }
+    }
+
+    // Get supervisor details
+    const supervisorDetails = supervisorIds.length > 0
+      ? await adminClient
+          .from('users')
+          .select('id, email, first_name, last_name, full_name')
+          .in('id', supervisorIds)
+          .eq('role', 'supervisor')
+      : { data: [], error: null }
+
+    const supervisorDetailsMap = new Map<string, any>()
+    if (supervisorDetails.data) {
+      supervisorDetails.data.forEach((sup: any) => {
+        supervisorDetailsMap.set(sup.id, sup)
+      })
+    }
+
+    // Build supervisor statistics array
+    const supervisorStats = Array.from(supervisorStatsMap.entries())
+      .map(([supervisorId, stats]) => {
+        const supervisor = supervisorDetailsMap.get(supervisorId)
+        const activeCasesCount = stats.cases.filter((c: any) => {
+          const start = new Date(c.start_date)
+          const end = c.end_date ? new Date(c.end_date) : null
+          return c.is_active && today >= start && (!end || today <= end)
+        }).length
+        
+        return {
+          id: supervisorId,
+          name: supervisor?.full_name || 
+                (supervisor?.first_name && supervisor?.last_name 
+                  ? `${supervisor.first_name} ${supervisor.last_name}`
+                  : supervisor?.email || 'Unknown Supervisor'),
+          email: supervisor?.email || '',
+          totalCases: stats.cases.length,
+          activeCases: activeCasesCount,
+          teamsCount: stats.teamIds.size,
+          teamLeadersCount: stats.teamLeaderIds.size,
+        }
+      })
+      .sort((a, b) => b.totalCases - a.totalCases) // Sort by total cases descending
+
+    return c.json({
+      summary: {
+        totalCases,
+        activeCases,
+        newCases,
+        avgResolutionTime,
+        successRate,
+        clinicianAssignment,
+        closedThisPeriod,
+        upcomingDeadlines,
+        overdueTasks,
+      },
+      caseTrends,
+      casesByStatus,
+      supervisorStats,
+    }, 200, {
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    })
+  } catch (error: any) {
+    console.error('[GET /whs/analytics] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get Clinician Performance data
+whs.get('/clinicians/performance', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+
+    // Get all clinicians
+    const { data: clinicians, error: cliniciansError } = await adminClient
+      .from('users')
+      .select('id, email, first_name, last_name, full_name')
+      .eq('role', 'clinician')
+      .order('full_name', { ascending: true, nullsFirst: false })
+
+    if (cliniciansError) {
+      console.error('[GET /whs/clinicians/performance] Error fetching clinicians:', cliniciansError)
+      return c.json({ error: 'Failed to fetch clinicians', details: cliniciansError.message }, 500)
+    }
+
+    if (!clinicians || clinicians.length === 0) {
+      return c.json({ clinicians: [] })
+    }
+
+    const clinicianIds = clinicians.map((c: any) => c.id)
+    const incidentTypes = ['accident', 'injury', 'medical_leave', 'other']
+
+    // Get all cases assigned to these clinicians
+    const { data: allCases, error: casesError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, clinician_id, is_active, start_date, end_date, created_at, notes, assigned_to_whs')
+      .in('exception_type', incidentTypes)
+      .eq('assigned_to_whs', true)
+      .in('clinician_id', clinicianIds)
+
+    if (casesError) {
+      console.error('[GET /whs/clinicians/performance] Error fetching cases:', casesError)
+      return c.json({ error: 'Failed to fetch cases', details: casesError.message }, 500)
+    }
+
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+
+    // Get assignment notifications to track when cases were assigned to clinicians
+    // OPTIMIZATION: Only fetch notifications for clinicians we have
+    const { data: assignmentNotifications } = await adminClient
+      .from('notifications')
+      .select('id, user_id, created_at, data')
+      .eq('type', 'case_assigned_to_clinician')
+      .in('user_id', clinicianIds)
+
+    // Build a map of clinician_id -> case_id -> assignment_date
+    // OPTIMIZATION: Handle case reassignments by keeping the LATEST assignment date
+    const assignmentDatesMap = new Map<string, Map<string, Date>>()
+    if (assignmentNotifications) {
+      assignmentNotifications.forEach((notif: any) => {
+        try {
+          const clinicianId = notif.user_id
+          const caseId = notif.data?.case_id
+          if (clinicianId && caseId && notif.created_at) {
+            if (!assignmentDatesMap.has(clinicianId)) {
+              assignmentDatesMap.set(clinicianId, new Map())
+            }
+            const assignmentDate = new Date(notif.created_at)
+            assignmentDate.setHours(0, 0, 0, 0)
+            
+            // If case was reassigned, keep the latest assignment date
+            const existingDate = assignmentDatesMap.get(clinicianId)!.get(caseId)
+            if (!existingDate || assignmentDate.getTime() > existingDate.getTime()) {
+              assignmentDatesMap.get(clinicianId)!.set(caseId, assignmentDate)
+            }
+          }
+        } catch {
+          // Ignore invalid data
+        }
+      })
+    }
+
+    // Get rehabilitation plans for these clinicians
+    const { data: rehabPlans } = await adminClient
+      .from('rehabilitation_plans')
+      .select('id, clinician_id, status, created_at')
+      .in('clinician_id', clinicianIds)
+
+    // OPTIMIZATION: Pre-group cases by clinician_id to avoid filtering in loop
+    const casesByClinician = new Map<string, any[]>()
+    if (allCases) {
+      allCases.forEach((c: any) => {
+        if (c.clinician_id) {
+          if (!casesByClinician.has(c.clinician_id)) {
+            casesByClinician.set(c.clinician_id, [])
+          }
+          casesByClinician.get(c.clinician_id)!.push(c)
+        }
+      })
+    }
+
+    // OPTIMIZATION: Helper function to parse notes once (cached)
+    const parseNotes = (notes: string | null): { status: string; approved_at: string | null } => {
+      if (!notes) return { status: 'open', approved_at: null }
+      try {
+        const notesData = JSON.parse(notes)
+        return {
+          status: notesData.case_status || 'open',
+          approved_at: notesData.approved_at || null
+        }
+      } catch {
+        return { status: 'open', approved_at: null }
+      }
+    }
+
+    // Calculate performance for each clinician
+    const performanceData = clinicians.map((clinician: any) => {
+      const clinicianCases = casesByClinician.get(clinician.id) || []
+      
+      // OPTIMIZATION: Pre-calculate dates and status once per case
+      const processedCases = clinicianCases.map((c: any) => {
+        const start = new Date(c.start_date)
+        start.setHours(0, 0, 0, 0)
+        const end = c.end_date ? new Date(c.end_date) : null
+        if (end) end.setHours(0, 0, 0, 0)
+        const notesParsed = parseNotes(c.notes)
+        
+        return {
+          ...c,
+          _startDate: start,
+          _endDate: end,
+          _status: notesParsed.status,
+          _approvedAt: notesParsed.approved_at
+        }
+      })
+      
+      // Active cases
+      const activeCases = processedCases.filter((c: any) => {
+        return c.is_active && today >= c._startDate && (!c._endDate || today <= c._endDate)
+      }).length
+
+      // Completed cases (closed or return to work)
+      const completedCases = processedCases.filter((c: any) => {
+        return c._status === 'closed' || c._status === 'return_to_work'
+      }).length
+
+      // Calculate average duration for completed cases
+      // Duration = from assignment to clinician until case closure by clinician
+      let avgDuration = 0
+      const completedCasesWithDates = processedCases.filter((c: any) => {
+        return c._status === 'closed' || c._status === 'return_to_work'
+      })
+
+      if (completedCasesWithDates.length > 0) {
+        // Get assignment dates map for this clinician
+        const assignmentDates = assignmentDatesMap.get(clinician.id) || new Map<string, Date>()
+        
+        const validDurations: number[] = []
+        
+        completedCasesWithDates.forEach((c: any) => {
+          // Get assignment date (when WHS assigned case to clinician)
+          const assignmentDate = assignmentDates.get(c.id)
+          if (!assignmentDate) {
+            // Skip if no notification found (can't calculate duration accurately)
+            return
+          }
+
+          // Get completion date (when clinician closed/approved the case)
+          let completionDate: Date | null = null
+          
+          // First, try to get approved_at from notes (most accurate)
+          if (c._approvedAt) {
+            completionDate = new Date(c._approvedAt)
+          } else if (c._endDate) {
+            // Fallback to end_date
+            completionDate = c._endDate
+          }
+          
+          // Skip if no completion date
+          if (!completionDate) {
+            return
+          }
+
+          // Normalize dates to start of day for accurate calculation
+          completionDate.setHours(0, 0, 0, 0)
+
+          // Calculate days between assignment and completion
+          const days = Math.ceil((completionDate.getTime() - assignmentDate.getTime()) / (1000 * 60 * 60 * 24))
+          
+          // Only count positive durations (shouldn't be negative, but safety check)
+          if (days >= 0) {
+            validDurations.push(days)
+          }
+        })
+
+        // Calculate average only if we have valid durations
+        if (validDurations.length > 0) {
+          const totalDays = validDurations.reduce((sum, days) => sum + days, 0)
+          avgDuration = Math.round(totalDays / validDurations.length)
+        }
+      }
+
+      // Success rate (completed / total assigned)
+      const totalAssigned = clinicianCases.length
+      const successRate = totalAssigned > 0 ? Math.round((completedCases / totalAssigned) * 100) : 0
+
+      // Get clinician name
+      const clinicianName = clinician.full_name || 
+                           (clinician.first_name && clinician.last_name 
+                             ? `${clinician.first_name} ${clinician.last_name}`
+                             : clinician.email)
+
+      // Specialty (default to General for now, can be extended later)
+      const specialty = 'General'
+
+      // Status (Available - can be extended to check if clinician is busy/on leave)
+      const status = 'Available'
+
+      return {
+        id: clinician.id,
+        name: clinicianName,
+        email: clinician.email,
+        specialty,
+        status,
+        activeCases,
+        completed: completedCases,
+        avgDuration,
+        successRate,
+        totalAssigned,
+      }
+    })
+
+    // Sort by active cases (descending), then by name
+    performanceData.sort((a, b) => {
+      if (b.activeCases !== a.activeCases) {
+        return b.activeCases - a.activeCases
+      }
+      return a.name.localeCompare(b.name)
+    })
+
+    return c.json({ clinicians: performanceData })
+  } catch (error: any) {
+    console.error('[GET /whs/clinicians/performance] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+export default whs
+
