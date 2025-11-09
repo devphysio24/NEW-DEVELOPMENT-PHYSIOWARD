@@ -13,10 +13,12 @@ import { generateUniqueQuickLoginCode, isValidQuickLoginCode } from '../utils/qu
 function setSecureCookies(c: any, accessToken: string, refreshToken: string, expiresAt: number, userId: string) {
   const isProduction = process.env.NODE_ENV === 'production'
   
-  // SECURITY: Use 'Lax' for development, 'Strict' for production
-  // 'Lax' allows cookies to be sent on top-level navigations (needed for localhost)
-  // 'Strict' is more secure but can cause issues in development
-  const sameSite = isProduction ? 'Strict' : 'Lax'
+  // For cross-origin requests (Vercel frontend → Render backend), use 'None'
+  // For same-origin or localhost, use 'Lax'
+  // 'None' requires 'Secure: true' (HTTPS only)
+  // 'Strict' doesn't work for cross-origin requests
+  const sameSite = isProduction ? 'None' : 'Lax'
+  const secure = isProduction // Must be true when SameSite=None
   
   // expiresAt is in seconds since epoch (Unix timestamp)
   // Calculate maxAge properly
@@ -34,13 +36,13 @@ function setSecureCookies(c: any, accessToken: string, refreshToken: string, exp
     maxAge = 3600
   }
   
-  console.log(`[setSecureCookies] Setting cookies for user: ${userId}, sameSite: ${sameSite}, secure: ${isProduction}`)
+  console.log(`[setSecureCookies] Setting cookies for user: ${userId}, sameSite: ${sameSite}, secure: ${secure}`)
   
   // Set access token cookie with proper expiration
   setCookie(c, COOKIE_NAMES.ACCESS_TOKEN, accessToken, {
     httpOnly: true,
-    secure: isProduction, // Only use Secure flag in production (HTTPS)
-    sameSite: sameSite, // 'Lax' for dev, 'Strict' for production
+    secure: secure, // Required when SameSite=None
+    sameSite: sameSite, // 'None' for cross-origin (production), 'Lax' for dev
     maxAge: maxAge, // 1 hour default, up to 7 days based on token expiration
     path: '/',
   })
@@ -49,7 +51,7 @@ function setSecureCookies(c: any, accessToken: string, refreshToken: string, exp
   const refreshTokenMaxAge = 3600 * 24 * 30 // 30 days
   setCookie(c, COOKIE_NAMES.REFRESH_TOKEN, refreshToken, {
     httpOnly: true,
-    secure: isProduction,
+    secure: secure,
     sameSite: sameSite,
     maxAge: refreshTokenMaxAge,
     path: '/',
@@ -59,7 +61,7 @@ function setSecureCookies(c: any, accessToken: string, refreshToken: string, exp
   // This helps detect when a different user logs in
   setCookie(c, COOKIE_NAMES.USER_ID, userId, {
     httpOnly: true,
-    secure: isProduction,
+    secure: secure,
     sameSite: sameSite,
     maxAge: refreshTokenMaxAge, // Same as refresh token
     path: '/',
@@ -71,13 +73,14 @@ function setSecureCookies(c: any, accessToken: string, refreshToken: string, exp
 // Helper function to clear cookies securely
 function clearCookies(c: any) {
   const isProduction = process.env.NODE_ENV === 'production'
-  const sameSite = isProduction ? 'Strict' : 'Lax' // Match setSecureCookies
+  const sameSite = isProduction ? 'None' : 'Lax' // Match setSecureCookies
+  const secure = isProduction // Must be true when SameSite=None
   
   // Clear access token cookie - set maxAge to 0 and empty value
   // Setting maxAge to 0 tells the browser to delete the cookie immediately
   setCookie(c, COOKIE_NAMES.ACCESS_TOKEN, '', {
     httpOnly: true,
-    secure: isProduction,
+    secure: secure,
     sameSite: sameSite,
     maxAge: 0, // Expires immediately - browser will delete the cookie
     path: '/',
@@ -86,7 +89,7 @@ function clearCookies(c: any) {
   // Clear refresh token cookie - set maxAge to 0 and empty value
   setCookie(c, COOKIE_NAMES.REFRESH_TOKEN, '', {
     httpOnly: true,
-    secure: isProduction,
+    secure: secure,
     sameSite: sameSite,
     maxAge: 0, // Expires immediately - browser will delete the cookie
     path: '/',
@@ -95,7 +98,7 @@ function clearCookies(c: any) {
   // Clear user_id cookie
   setCookie(c, COOKIE_NAMES.USER_ID, '', {
     httpOnly: true,
-    secure: isProduction,
+    secure: secure,
     sameSite: sameSite,
     maxAge: 0, // Expires immediately - browser will delete the cookie
     path: '/',
@@ -619,24 +622,25 @@ auth.post('/logout', async (c) => {
     // SECURITY: Also clear any potential Authorization header by setting empty cookie
     // This ensures no residual authentication data remains
     const isProduction = process.env.NODE_ENV === 'production'
-    const sameSite = isProduction ? 'Strict' : 'Lax' // Match setSecureCookies
+    const sameSite = isProduction ? 'None' : 'Lax' // Match setSecureCookies
+    const secure = isProduction // Must be true when SameSite=None
     setCookie(c, COOKIE_NAMES.ACCESS_TOKEN, '', {
       httpOnly: true,
-      secure: isProduction,
+      secure: secure,
       sameSite: sameSite,
       maxAge: 0,
       path: '/',
     })
     setCookie(c, COOKIE_NAMES.REFRESH_TOKEN, '', {
       httpOnly: true,
-      secure: isProduction,
+      secure: secure,
       sameSite: sameSite,
       maxAge: 0,
       path: '/',
     })
     setCookie(c, COOKIE_NAMES.USER_ID, '', {
       httpOnly: true,
-      secure: isProduction,
+      secure: secure,
       sameSite: sameSite,
       maxAge: 0,
       path: '/',
