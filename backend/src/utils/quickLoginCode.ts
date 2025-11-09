@@ -1,4 +1,4 @@
-import { getAdminClient } from './adminClient'
+import { getAdminClient } from './adminClient.js'
 
 /**
  * Generates a unique 6-digit quick login code

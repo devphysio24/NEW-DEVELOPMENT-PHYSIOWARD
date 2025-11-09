@@ -2,12 +2,12 @@ import { Hono } from 'hono'
 import { setCookie, getCookie } from 'hono/cookie'
 import bcrypt from 'bcrypt'
 import crypto from 'crypto'
-import { supabase } from '../lib/supabase'
-import { authMiddleware, requireRole, AuthVariables, COOKIE_NAMES } from '../middleware/auth'
-import { sanitizeInput, isValidEmail, isValidName, isValidPassword } from '../middleware/security'
-import { getAdminClient } from '../utils/adminClient'
-import { ensureUserRecordExists } from '../utils/userUtils'
-import { generateUniqueQuickLoginCode, isValidQuickLoginCode } from '../utils/quickLoginCode'
+import { supabase } from '../lib/supabase.js'
+import { authMiddleware, requireRole, AuthVariables, COOKIE_NAMES } from '../middleware/auth.js'
+import { sanitizeInput, isValidEmail, isValidName, isValidPassword } from '../middleware/security.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { ensureUserRecordExists } from '../utils/userUtils.js'
+import { generateUniqueQuickLoginCode, isValidQuickLoginCode } from '../utils/quickLoginCode.js'
 
 // Helper function to set secure cookies
 function setSecureCookies(c: any, accessToken: string, refreshToken: string, expiresAt: number, userId: string) {

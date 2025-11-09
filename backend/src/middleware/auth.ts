@@ -1,7 +1,7 @@
 import { Context, Next } from 'hono'
 import { getCookie, getSignedCookie } from 'hono/cookie'
-import { supabase } from '../lib/supabase'
-import { getAdminClient } from '../utils/adminClient'
+import { supabase } from '../lib/supabase.js'
+import { getAdminClient } from '../utils/adminClient.js'
 
 export interface User {
   id: string

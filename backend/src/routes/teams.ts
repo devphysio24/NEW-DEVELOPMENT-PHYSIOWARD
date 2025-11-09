@@ -1,9 +1,9 @@
 import { Hono } from 'hono'
 import bcrypt from 'bcrypt'
-import { supabase } from '../lib/supabase'
-import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth'
-import { getAdminClient } from '../utils/adminClient'
-import { generateUniqueQuickLoginCode } from '../utils/quickLoginCode'
+import { supabase } from '../lib/supabase.js'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { generateUniqueQuickLoginCode } from '../utils/quickLoginCode.js'
 
 const teams = new Hono<{ Variables: AuthVariables }>()
 

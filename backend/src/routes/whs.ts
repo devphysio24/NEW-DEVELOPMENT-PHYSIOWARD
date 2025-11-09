@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
-import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth'
-import { getCaseStatusFromNotes, mapCaseStatusToDisplay, CaseStatus } from '../utils/caseStatus'
-import { getAdminClient } from '../utils/adminClient'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getCaseStatusFromNotes, mapCaseStatusToDisplay, CaseStatus } from '../utils/caseStatus.js'
+import { getAdminClient } from '../utils/adminClient.js'
 
 const whs = new Hono<{ Variables: AuthVariables }>()
 

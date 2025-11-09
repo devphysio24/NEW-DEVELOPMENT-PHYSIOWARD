@@ -1,8 +1,8 @@
 import { Hono } from 'hono'
-import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth'
-import { getCaseStatusFromNotes, mapCaseStatusToDisplay, isValidCaseStatus } from '../utils/caseStatus'
-import { getAdminClient } from '../utils/adminClient'
-import { formatDateString, parseDateString } from '../utils/dateTime'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getCaseStatusFromNotes, mapCaseStatusToDisplay, isValidCaseStatus } from '../utils/caseStatus.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { formatDateString, parseDateString } from '../utils/dateTime.js'
 
 const clinician = new Hono<{ Variables: AuthVariables }>()
 

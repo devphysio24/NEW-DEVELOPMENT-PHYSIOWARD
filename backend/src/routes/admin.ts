@@ -1,8 +1,8 @@
 import { Hono } from 'hono'
 import bcrypt from 'bcrypt'
-import { authMiddleware, requireRole } from '../middleware/auth'
-import { getAdminClient } from '../utils/adminClient'
-import { supabase } from '../lib/supabase'
+import { authMiddleware, requireRole } from '../middleware/auth.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { supabase } from '../lib/supabase.js'
 
 const admin = new Hono()
 

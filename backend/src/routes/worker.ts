@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
-import { authMiddleware, requireRole } from '../middleware/auth'
-import { getAdminClient } from '../utils/adminClient'
-import { analyzeIncident } from '../utils/openai'
+import { authMiddleware, requireRole } from '../middleware/auth.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { analyzeIncident } from '../utils/openai.js'
 
 const worker = new Hono()
 

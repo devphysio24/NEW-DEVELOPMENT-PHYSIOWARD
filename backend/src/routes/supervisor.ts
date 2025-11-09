@@ -1,10 +1,10 @@
 import { Hono } from 'hono'
 import bcrypt from 'bcrypt'
-import { supabase } from '../lib/supabase'
-import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth'
-import { getCaseStatusFromNotes } from '../utils/caseStatus'
-import { getAdminClient } from '../utils/adminClient'
-import { isValidEmail } from '../middleware/security'
+import { supabase } from '../lib/supabase.js'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getCaseStatusFromNotes } from '../utils/caseStatus.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { isValidEmail } from '../middleware/security.js'
 
 const supervisor = new Hono<{ Variables: AuthVariables }>()
 

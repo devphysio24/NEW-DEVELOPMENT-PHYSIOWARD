@@ -1,4 +1,4 @@
-import { getAdminClient } from './adminClient'
+import { getAdminClient } from './adminClient.js'
 
 /**
  * Ensures a user record exists in the database.

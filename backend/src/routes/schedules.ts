@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
-import { supabase } from '../lib/supabase'
-import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth'
-import { getAdminClient } from '../utils/adminClient'
+import { supabase } from '../lib/supabase.js'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getAdminClient } from '../utils/adminClient.js'
 
 const schedules = new Hono<{ Variables: AuthVariables }>()
 

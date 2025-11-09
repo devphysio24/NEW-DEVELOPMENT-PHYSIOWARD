@@ -1,9 +1,9 @@
 import { Hono } from 'hono'
-import { supabase } from '../lib/supabase'
-import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth'
-import { getCaseStatusFromNotes } from '../utils/caseStatus'
-import { getAdminClient } from '../utils/adminClient'
-import { parseTime, compareTime, formatDateString, parseDateString } from '../utils/dateTime'
+import { supabase } from '../lib/supabase.js'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getCaseStatusFromNotes } from '../utils/caseStatus.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { parseTime, compareTime, formatDateString, parseDateString } from '../utils/dateTime.js'
 
 // Date/time utilities are now imported from '../utils/dateTime'
 
