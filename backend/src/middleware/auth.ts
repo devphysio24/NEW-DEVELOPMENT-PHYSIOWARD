@@ -128,10 +128,6 @@ export function requireRole(allowedRoles: string[]) {
       )
     }
 
-    console.log(
-      `[requireRole] Access granted: ${user.email} (${user.role}) -> ${method} ${path}`
-    )
-
     await next()
   }
 }

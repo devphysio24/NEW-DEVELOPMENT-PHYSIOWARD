@@ -15,21 +15,35 @@ worker.get('/can-report-incident', authMiddleware, requireRole(['worker']), asyn
 
     const adminClient = getAdminClient()
 
-    // Check if worker has active exception
+    // Check if worker has active exception (excluding closed cases)
     const { data: existingException, error: existingError } = await adminClient
       .from('worker_exceptions')
-      .select('id, exception_type, reason, start_date, end_date, notes')
+      .select('id, exception_type, reason, start_date, end_date, notes, deactivated_at')
       .eq('user_id', user.id)
       .eq('is_active', true)
       .maybeSingle()
 
     if (existingException) {
-      // Extract case status from notes if available
-      const caseStatus = existingException.notes?.includes('case_status') 
-        ? existingException.notes.match(/case_status["\s]*[:=]["\s]*([^,}\s"]+)/i)?.[1]?.toLowerCase()
-        : null
+      // Check if case is closed by checking case_status in notes or deactivated_at timestamp
+      let isClosed = false
       
-      const isClosed = caseStatus === 'closed'
+      // Check deactivated_at timestamp first (if case was closed by supervisor)
+      if (existingException.deactivated_at) {
+        isClosed = true
+      } else if (existingException.notes) {
+        // Check case_status in notes (if case was closed by clinician)
+        try {
+          const notesData = typeof existingException.notes === 'string' 
+            ? JSON.parse(existingException.notes) 
+            : existingException.notes
+          const caseStatus = notesData?.case_status?.toLowerCase()
+          isClosed = caseStatus === 'closed' || caseStatus === 'return_to_work'
+        } catch {
+          // If notes is not JSON, try regex match (backward compatibility)
+          const caseStatus = existingException.notes.match(/case_status["\s]*[:=]["\s]*([^,}\s"]+)/i)?.[1]?.toLowerCase()
+          isClosed = caseStatus === 'closed' || caseStatus === 'return_to_work'
+        }
+      }
 
       if (!isClosed) {
         return c.json({
@@ -184,21 +198,35 @@ worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (
       return c.json({ error: 'Team information not available. Please contact your supervisor.' }, 500)
     }
 
-    // Check if worker already has active exception or incident report
+    // Check if worker already has active exception or incident report (excluding closed cases)
     const { data: existingException, error: existingError } = await adminClient
       .from('worker_exceptions')
-      .select('id, exception_type, reason, start_date, end_date, notes')
+      .select('id, exception_type, reason, start_date, end_date, notes, deactivated_at')
       .eq('user_id', user.id)
       .eq('is_active', true)
       .maybeSingle()
 
     if (existingException) {
-      // Extract case status from notes if available
-      const caseStatus = existingException.notes?.includes('case_status') 
-        ? existingException.notes.match(/case_status["\s]*[:=]["\s]*([^,}\s"]+)/i)?.[1]?.toLowerCase()
-        : null
+      // Check if case is closed by checking case_status in notes or deactivated_at timestamp
+      let isClosed = false
       
-      const isClosed = caseStatus === 'closed'
+      // Check deactivated_at timestamp first (if case was closed by supervisor)
+      if (existingException.deactivated_at) {
+        isClosed = true
+      } else if (existingException.notes) {
+        // Check case_status in notes (if case was closed by clinician)
+        try {
+          const notesData = typeof existingException.notes === 'string' 
+            ? JSON.parse(existingException.notes) 
+            : existingException.notes
+          const caseStatus = notesData?.case_status?.toLowerCase()
+          isClosed = caseStatus === 'closed' || caseStatus === 'return_to_work'
+        } catch {
+          // If notes is not JSON, try regex match (backward compatibility)
+          const caseStatus = existingException.notes.match(/case_status["\s]*[:=]["\s]*([^,}\s"]+)/i)?.[1]?.toLowerCase()
+          isClosed = caseStatus === 'closed' || caseStatus === 'return_to_work'
+        }
+      }
       
       if (!isClosed) {
         return c.json({ 

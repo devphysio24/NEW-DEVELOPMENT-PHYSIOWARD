@@ -1552,6 +1552,8 @@ supervisor.get('/analytics', authMiddleware, requireRole(['supervisor']), async 
     const teamStats = Array.from(teamStatsMap.values())
 
     // Team leader performance
+    // IMPORTANT: Always return entries for all teams, even if they have no data in the date range
+    // This ensures the frontend can display teams even when filtering by date range with no check-ins
     const teamLeaderPerformance = assignedTeams.map(team => {
       const teamStat = teamStatsMap.get(team.id)
       const teamLeader = teamLeaderMap.get(team.team_leader_id)
@@ -1746,6 +1748,12 @@ supervisor.get('/analytics', authMiddleware, requireRole(['supervisor']), async 
         byTeam: Object.fromEntries(exceptionsByTeam),
         total: totalActiveExceptions,
       },
+    }
+
+    // Ensure response data structure is complete
+    if (!responseData.teamLeaderPerformance || !Array.isArray(responseData.teamLeaderPerformance)) {
+      console.error('[GET /supervisor/analytics] ERROR: teamLeaderPerformance is missing or not an array')
+      responseData.teamLeaderPerformance = []
     }
 
     // Store in cache (5 minute TTL)
@@ -2019,12 +2027,21 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
       const endDate = incident.end_date ? new Date(incident.end_date) : null
       const isCurrentlyActive = todayDate >= startDate && (!endDate || todayDate <= endDate) && incident.is_active
 
-      // Extract case status from notes
+      // Extract case status and other information from notes
       let caseStatus: string | null = null
+      let approvedBy: string | null = null
+      let approvedAt: string | null = null
+      let returnToWorkDutyType: string | null = null
+      let returnToWorkDate: string | null = null
+      
       if (incident.notes) {
         try {
           const notesData = JSON.parse(incident.notes)
           caseStatus = notesData.case_status || null
+          approvedBy = notesData.approved_by || null
+          approvedAt = notesData.approved_at || null
+          returnToWorkDutyType = notesData.return_to_work_duty_type || null
+          returnToWorkDate = notesData.return_to_work_date || null
         } catch {
           // Notes is not JSON, ignore
         }
@@ -2054,6 +2071,10 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
         clinicianEmail: clinician?.email || null,
         caseStatus: caseStatus,
         notes: incident.notes || null,
+        approvedBy: approvedBy,
+        approvedAt: approvedAt,
+        returnToWorkDutyType: returnToWorkDutyType || incident.return_to_work_duty_type || null,
+        returnToWorkDate: returnToWorkDate || incident.return_to_work_date || null,
         createdAt: incident.created_at,
         updatedAt: incident.updated_at,
       }
@@ -2188,16 +2209,39 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
       return c.json({ error: 'Worker not found in this team' }, 404)
     }
 
-    // Check if worker already has active exception
+    // Check if worker already has active exception (excluding closed cases)
     const { data: existingException, error: existingError } = await adminClient
       .from('worker_exceptions')
-      .select('id')
+      .select('id, notes, is_active, deactivated_at')
       .eq('user_id', workerId)
       .eq('is_active', true)
-      .single()
+      .maybeSingle()
 
     if (existingException) {
+      // Check if case is closed (case_status in notes)
+      let isClosed = false
+      if (existingException.notes) {
+        try {
+          const notesData = typeof existingException.notes === 'string' 
+            ? JSON.parse(existingException.notes) 
+            : existingException.notes
+          const caseStatus = notesData?.case_status?.toLowerCase()
+          isClosed = caseStatus === 'closed' || caseStatus === 'return_to_work'
+        } catch {
+          // If notes is not JSON, try regex match (backward compatibility)
+          const caseStatus = existingException.notes.match(/case_status["\s]*[:=]["\s]*([^,}\s"]+)/i)?.[1]?.toLowerCase()
+          isClosed = caseStatus === 'closed' || caseStatus === 'return_to_work'
+        }
+      }
+      
+      // Also check deactivated_at timestamp (if case was closed by supervisor)
+      if (!isClosed && existingException.deactivated_at) {
+        isClosed = true
+      }
+      
+      if (!isClosed) {
       return c.json({ error: 'Worker already has an active incident/exception' }, 400)
+      }
     }
 
     // OPTIMIZATION: Automatically deactivate all active schedules when incident is reported

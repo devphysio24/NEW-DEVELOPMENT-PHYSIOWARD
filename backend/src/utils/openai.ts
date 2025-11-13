@@ -20,6 +20,19 @@ interface AnalysisResult {
   advice: string // Advice/suggestions based on description
 }
 
+interface AnalyzeTranscriptionParams {
+  transcription: string
+  context?: string // Optional context (e.g., case number, worker name)
+}
+
+interface TranscriptionAnalysisResult {
+  summary: string
+  keyPoints: string[]
+  clinicalNotes: string
+  recommendations: string[]
+  actionItems: string[]
+}
+
 /**
  * Analyze incident report using OpenAI API
  * Optimized for cost: Uses GPT-3.5-turbo with concise prompts
@@ -111,6 +124,168 @@ Provide your clinical assessment, medical recommendations, and professional advi
         'Schedule follow-up clinical assessment'
       ],
       advice: 'As a clinician, I recommend immediate medical evaluation if any injuries occurred. Ensure proper clinical documentation and follow workplace safety protocols.'
+    }
+  }
+}
+
+/**
+ * Transcribe audio using OpenAI Whisper API
+ * @param audioFile - Audio file buffer or File object
+ * @returns Transcribed text
+ */
+export async function transcribeAudio(audioFile: File | Buffer | Blob): Promise<string> {
+  const apiKey = process.env.OPENAI_API_KEY
+  
+  if (!apiKey) {
+    throw new Error('OpenAI API key not configured')
+  }
+
+  const { OpenAI } = await import('openai')
+  const openai = new OpenAI({ apiKey })
+
+  try {
+    // Handle different input types and convert to Buffer for OpenAI SDK
+    // OpenAI SDK for Node.js works best with File objects that have proper metadata
+    let fileData: Buffer
+    let fileName: string = 'audio.webm'
+    let mimeType: string = 'audio/webm'
+    
+    if (Buffer.isBuffer(audioFile)) {
+      // Already a Buffer
+      fileData = audioFile
+    } else if (audioFile && typeof audioFile === 'object' && 'arrayBuffer' in audioFile) {
+      // Handle Blob or File objects
+      const blob = audioFile as Blob | File
+      const arrayBuffer = await blob.arrayBuffer()
+      fileData = Buffer.from(arrayBuffer)
+      
+      if ('name' in blob && blob.name) {
+        // It's a File object
+        fileName = blob.name
+        mimeType = blob.type || mimeType
+      } else {
+        // It's a Blob
+        mimeType = blob.type || mimeType
+        // Extract extension from mime type
+        const ext = mimeType.split('/')[1] || 'webm'
+        fileName = `audio.${ext}`
+      }
+    } else {
+      throw new Error('Invalid audio file type')
+    }
+
+    // For Node.js, OpenAI SDK accepts File object or Buffer
+    // Create a File object with proper metadata for the SDK
+    // Note: OpenAI SDK for Node.js expects File objects with proper name and type
+    const fileToUpload = new File([fileData], fileName, { 
+      type: mimeType,
+      lastModified: Date.now()
+    })
+
+    // Ensure the file has the correct properties for OpenAI SDK
+    // The SDK will create multipart form data from the File object
+    const transcriptionResponse = await openai.audio.transcriptions.create({
+      file: fileToUpload,
+      model: 'whisper-1',
+      language: 'en', // Optional: specify language for better accuracy
+      response_format: 'text'
+    })
+
+    // Handle response format - can be string or object with text property
+    if (typeof transcriptionResponse === 'string') {
+      return transcriptionResponse
+    } else if (transcriptionResponse && typeof transcriptionResponse === 'object') {
+      const response = transcriptionResponse as { text?: string }
+      return response.text || String(transcriptionResponse)
+    } else {
+      return String(transcriptionResponse)
+    }
+  } catch (error: any) {
+    console.error('[Whisper Transcription] Error:', error)
+    throw new Error(`Transcription failed: ${error.message || 'Unknown error'}`)
+  }
+}
+
+/**
+ * Analyze transcription using OpenAI GPT
+ * Optimized for clinical notes and assessments
+ */
+export async function analyzeTranscription(params: AnalyzeTranscriptionParams): Promise<TranscriptionAnalysisResult> {
+  const apiKey = process.env.OPENAI_API_KEY
+  
+  if (!apiKey) {
+    throw new Error('OpenAI API key not configured')
+  }
+
+  const { OpenAI } = await import('openai')
+  const openai = new OpenAI({ apiKey })
+
+  const systemPrompt = `You are an expert clinician specializing in workplace safety and occupational health. Analyze clinical notes and patient conversations from a medical perspective. Extract key information, provide clinical insights, and suggest actionable recommendations. Respond in JSON format:
+{
+  "summary": "Brief 2-3 sentence summary of the conversation",
+  "keyPoints": ["3-5 key points or findings"],
+  "clinicalNotes": "Detailed clinical notes and observations (2-3 sentences)",
+  "recommendations": ["3-4 clinical recommendations"],
+  "actionItems": ["2-3 specific action items for follow-up"]
+}`
+
+  const userPrompt = `As an expert clinician, analyze this clinical conversation transcription:
+${params.context ? `Context: ${params.context}\n\n` : ''}Transcription:
+${params.transcription}
+
+Provide your clinical analysis, extract key medical information, and suggest recommendations.`
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo', // Cost-effective model
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: 0.3,
+      max_tokens: 800,
+      response_format: { type: 'json_object' }
+    })
+
+    const content = completion.choices[0]?.message?.content
+    if (!content) {
+      throw new Error('No response from OpenAI')
+    }
+
+    const analysis = JSON.parse(content) as TranscriptionAnalysisResult
+
+    // Validate and sanitize response
+    return {
+      summary: analysis.summary || 'Analysis completed',
+      keyPoints: Array.isArray(analysis.keyPoints) 
+        ? analysis.keyPoints.slice(0, 5)
+        : ['Review transcription for key clinical information'],
+      clinicalNotes: analysis.clinicalNotes || 'Clinical notes extracted from conversation',
+      recommendations: Array.isArray(analysis.recommendations)
+        ? analysis.recommendations.slice(0, 4)
+        : ['Review clinical notes', 'Schedule follow-up if needed', 'Document findings'],
+      actionItems: Array.isArray(analysis.actionItems)
+        ? analysis.actionItems.slice(0, 3)
+        : ['Review transcription', 'Update clinical records', 'Schedule follow-up']
+    }
+  } catch (error: any) {
+    console.error('[OpenAI Transcription Analysis] Error:', error)
+    
+    // Return fallback analysis
+    return {
+      summary: 'Unable to complete clinical analysis. Please review transcription manually.',
+      keyPoints: ['Review transcription for key information'],
+      clinicalNotes: 'Clinical notes require manual review',
+      recommendations: [
+        'Review transcription carefully',
+        'Extract key clinical information',
+        'Document findings in patient records'
+      ],
+      actionItems: [
+        'Review transcription',
+        'Update clinical records',
+        'Schedule follow-up if needed'
+      ]
     }
   }
 }

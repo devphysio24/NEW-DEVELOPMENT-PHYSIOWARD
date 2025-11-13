@@ -67,6 +67,31 @@ const validateDateInput = (dateStr: any): { valid: boolean; error?: string; date
   }
 }
 
+// OPTIMIZATION: Centralized utility for duty type label formatting
+const formatDutyTypeLabel = (dutyType: string | null | undefined): string => {
+  if (!dutyType || typeof dutyType !== 'string') {
+    return 'Unknown'
+  }
+  const normalized = dutyType.trim().toLowerCase()
+  return normalized === 'modified' ? 'Modified Duties' : normalized === 'full' ? 'Full Duties' : 'Unknown'
+}
+
+// OPTIMIZATION: Centralized utility for formatting return date in notifications
+const formatReturnDateForNotification = (dateStr: string | null | undefined): string => {
+  if (!dateStr || typeof dateStr !== 'string') {
+    return 'Invalid Date'
+  }
+  try {
+    const date = parseDateString(dateStr)
+    if (isNaN(date.getTime())) {
+      return 'Invalid Date'
+    }
+    return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+  } catch {
+    return 'Invalid Date'
+  }
+}
+
 
 
 // Get cases assigned to clinician (cases that need medical attention)
@@ -148,18 +173,39 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
     const { count } = countResult
     const { data: cases, error: casesError } = casesResult
 
+
     if (casesError) {
-      console.error('[GET /clinician/cases] Error:', casesError)
+      console.error('[GET /clinician/cases] Database Error:', casesError)
+      console.error('[GET /clinician/cases] User ID:', user.id)
+      console.error('[GET /clinician/cases] Query filters:', {
+        exception_types: ['injury', 'medical_leave', 'accident', 'other'],
+        clinician_id: user.id,
+        assigned_to_whs: true,
+        status
+      })
       return c.json({ error: 'Failed to fetch cases', details: casesError.message }, 500)
     }
 
+    // Ensure cases is always an array
+
     // Get rehabilitation plans for cases (to determine rehab status)
+    // SECURITY & OPTIMIZATION: Only get plans for this clinician's cases
     const caseIds = (cases || []).map((c: any) => c.id)
-    const { data: rehabPlans } = await adminClient
+    let rehabPlans: any[] = []
+    if (caseIds.length > 0) {
+      const { data: rehabPlansData, error: rehabError } = await adminClient
       .from('rehabilitation_plans')
       .select('exception_id, status')
       .in('exception_id', caseIds)
+          .eq('clinician_id', user.id) // SECURITY: Only plans assigned to this clinician
       .eq('status', 'active')
+      
+      if (rehabError) {
+        console.error('[GET /clinician/cases] Error fetching rehab plans:', rehabError)
+      } else {
+        rehabPlans = rehabPlansData || []
+      }
+    }
 
     const rehabMap = new Map()
     if (rehabPlans) {
@@ -206,7 +252,8 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
     // Format cases (OPTIMIZATION: Pre-calculate date once, use Map for O(1) lookups)
     const todayDate = new Date()
     todayDate.setHours(0, 0, 0, 0) // Normalize to start of day for accurate comparison
-    let formattedCases = (cases || []).map((incident: any) => {
+    const casesArray = Array.isArray(cases) ? cases : []
+    let formattedCases = casesArray.map((incident: any) => {
       // OPTIMIZATION: Use direct array access instead of Array.isArray check (faster)
       const user = incident.users?.[0] || incident.users
       const team = incident.teams?.[0] || incident.teams
@@ -267,6 +314,8 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
         notes: incident.notes || null,
         createdAt: incident.created_at,
         updatedAt: incident.updated_at,
+        return_to_work_duty_type: incident.return_to_work_duty_type || null,
+        return_to_work_date: incident.return_to_work_date || null,
       }
     })
 
@@ -291,12 +340,14 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
       .eq('assigned_to_whs', true)
 
     // OPTIMIZATION: Only get rehab plans for THIS clinician's cases, not all plans
+    // SECURITY: Also filter by clinician_id for additional security
     const allCaseIds = (allCases || []).map(c => c.id)
     const { data: allRehabPlans } = allCaseIds.length > 0
       ? await adminClient
           .from('rehabilitation_plans')
           .select('exception_id, status')
           .in('exception_id', allCaseIds) // Only get plans for this clinician's cases
+          .eq('clinician_id', user.id) // SECURITY: Only plans assigned to this clinician
       : { data: [] }
 
     // OPTIMIZATION: Pre-build Set for O(1) lookup instead of O(n) in loop
@@ -342,7 +393,7 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
       pendingConfirmation: 0,
     }
 
-    return c.json({
+    const responseData = {
       cases: formattedCases,
       summary,
       pagination: {
@@ -353,7 +404,9 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
         hasNext: page < Math.ceil((count || 0) / limit),
         hasPrev: page > 1,
       },
-    }, 200, {
+    }
+    
+    return c.json(responseData, 200, {
       'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
       'Pragma': 'no-cache',
       'Expires': '0',
@@ -403,13 +456,14 @@ clinician.get('/rehabilitation-plans/:id/progress', authMiddleware, requireRole(
         )
       `)
       .eq('id', planId)
+      .eq('clinician_id', user.id) // SECURITY & OPTIMIZATION: Filter by clinician_id first
       .single()
 
     if (planError || !plan) {
-      return c.json({ error: 'Plan not found' }, 404)
+      return c.json({ error: 'Plan not found or not authorized' }, 404)
     }
 
-    // SECURITY: Ensure clinician can only view their own plans
+    // SECURITY: Double-check ownership (defense in depth)
     if (plan.clinician_id !== user.id) {
       console.error(`[GET /clinician/rehabilitation-plans/:id/progress] SECURITY: User ${user.id} attempted to view plan ${planId} owned by ${plan.clinician_id}`)
       return c.json({ error: 'Forbidden: You can only view your own rehabilitation plans' }, 403)
@@ -613,6 +667,7 @@ clinician.get('/rehabilitation-plans', authMiddleware, requireRole(['clinician']
           exercise_order
         )
       `)
+      .eq('clinician_id', user.id) // SECURITY: Only show plans assigned to this clinician
 
     if (status === 'active') {
       query = query.eq('status', 'active')
@@ -625,9 +680,13 @@ clinician.get('/rehabilitation-plans', authMiddleware, requireRole(['clinician']
     const { data: plans, error } = await query.order('created_at', { ascending: false })
 
     if (error) {
-      console.error('[GET /clinician/rehabilitation-plans] Error:', error)
+      console.error('[GET /clinician/rehabilitation-plans] Database Error:', error)
+      console.error('[GET /clinician/rehabilitation-plans] User ID:', user.id)
+      console.error('[GET /clinician/rehabilitation-plans] Status filter:', status)
       return c.json({ error: 'Failed to fetch rehabilitation plans', details: error.message }, 500)
     }
+
+    // Ensure plans is always an array
 
     // OPTIMIZATION: Build plan_id to user_id mapping first
     const planIds = (plans || []).map((p: any) => p.id)
@@ -681,7 +740,8 @@ clinician.get('/rehabilitation-plans', authMiddleware, requireRole(['clinician']
     }
 
     // Format plans (no await needed inside map)
-    const formattedPlans = (plans || []).map((plan: any) => {
+    const plansArray = Array.isArray(plans) ? plans : []
+    const formattedPlans = plansArray.map((plan: any) => {
       const exception = plan.worker_exceptions
       const user = Array.isArray(exception?.users) ? exception?.users[0] : exception?.users
       const team = Array.isArray(exception?.teams) ? exception?.teams[0] : exception?.teams
@@ -1092,10 +1152,16 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
     }
 
     const caseId = c.req.param('id')
-    const { status } = await c.req.json()
+    const { status, return_to_work_duty_type, return_to_work_date } = await c.req.json()
 
-    if (!caseId) {
-      return c.json({ error: 'Case ID is required' }, 400)
+    // SECURITY: Validate case ID format (UUID)
+    if (!caseId || typeof caseId !== 'string' || caseId.length > 36) {
+      return c.json({ error: 'Invalid case ID format' }, 400)
+    }
+    
+    // SECURITY: Validate that return to work fields are only provided when status is return_to_work
+    if (status !== 'return_to_work' && (return_to_work_duty_type || return_to_work_date)) {
+      return c.json({ error: 'Return to work fields can only be set when status is return_to_work' }, 400)
     }
 
     // Security: Validate status using centralized utility
@@ -1110,7 +1176,7 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
     // OPTIMIZATION: Single query to get case with notes (reduces database round trips)
     const { data: caseItem, error: caseError } = await adminClient
       .from('worker_exceptions')
-      .select('id, clinician_id, is_active, start_date, end_date, notes')
+      .select('id, clinician_id, is_active, start_date, end_date, notes, return_to_work_duty_type, return_to_work_date')
       .eq('id', caseId)
       .eq('clinician_id', user.id)
       .single()
@@ -1123,12 +1189,6 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
     // Only fetch from DB if we need additional user fields not in auth context
     const clinicianName = formatUserName(user)
 
-    // Prepare updates based on status
-    const now = new Date()
-    const updates: any = {
-      updated_at: now.toISOString(),
-    }
-
     // OPTIMIZATION: Parse notes once and reuse
     let notesData: any = {}
     if (caseItem.notes) {
@@ -1138,6 +1198,27 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
         // If notes is not JSON, preserve it as text
         notesData = { original_notes: caseItem.notes }
       }
+    }
+    
+    // BUSINESS RULE: If case is already "return_to_work", prevent changing back to earlier statuses
+    const currentCaseStatus = notesData?.case_status?.toLowerCase() || 
+                             (caseItem.return_to_work_duty_type ? 'return_to_work' : null)
+    
+    if (currentCaseStatus === 'return_to_work') {
+      // Only allow changing to "closed" or keeping as "return_to_work"
+      const restrictedStatuses = ['new', 'triaged', 'assessed', 'in_rehab']
+      if (restrictedStatuses.includes(status.toLowerCase())) {
+        return c.json({ 
+          error: 'Cannot change status back to earlier stages once case is set to "Return to Work"',
+          details: 'Once a case has been marked as "Return to Work", it can only be changed to "Closed" or remain as "Return to Work".'
+        }, 400)
+      }
+    }
+
+    // Prepare updates based on status
+    const now = new Date()
+    const updates: any = {
+      updated_at: now.toISOString(),
     }
     
     // Update case_status in notes
@@ -1168,6 +1249,45 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
     } else if (status === 'return_to_work') {
       updates.is_active = false
       updates.end_date = todayDateStr
+      
+      // SECURITY: Validate and set return to work fields
+      if (!return_to_work_duty_type || typeof return_to_work_duty_type !== 'string') {
+        return c.json({ error: 'Return to work requires duty type' }, 400)
+      }
+      
+      if (!return_to_work_date || typeof return_to_work_date !== 'string') {
+        return c.json({ error: 'Return to work requires return date' }, 400)
+      }
+      
+      // SECURITY: Validate duty type (whitelist approach with type safety)
+      const validDutyTypes = ['modified', 'full'] as const
+      const normalizedDutyType = return_to_work_duty_type.trim().toLowerCase()
+      if (!validDutyTypes.includes(normalizedDutyType as typeof validDutyTypes[number])) {
+        return c.json({ error: 'Duty type must be either "modified" or "full"' }, 400)
+      }
+      
+      // SECURITY: Validate and format date using centralized utility
+      const dateValidation = validateDateInput(return_to_work_date)
+      if (!dateValidation.valid || !dateValidation.date) {
+        return c.json({ error: dateValidation.error || 'Invalid return date format. Expected YYYY-MM-DD' }, 400)
+      }
+      
+      // OPTIMIZATION: Prevent setting return date in the past (business logic)
+      const returnDate = dateValidation.date!
+      returnDate.setHours(0, 0, 0, 0)
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      
+      if (returnDate < today) {
+        return c.json({ error: 'Return date cannot be in the past' }, 400)
+      }
+      
+      // Format date to YYYY-MM-DD using utility function
+      const formattedReturnDate = formatDateString(returnDate)
+      
+      // SECURITY: Sanitize duty type (use already normalized value)
+      updates.return_to_work_duty_type = normalizedDutyType
+      updates.return_to_work_date = formattedReturnDate
     } else {
       updates.is_active = true
     }
@@ -1233,12 +1353,20 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
             const statusLabel = status === 'closed' ? 'CLOSED' : 'RETURN TO WORK'
             const statusAction = status === 'closed' ? 'closed' : 'marked as return to work'
             
+            // OPTIMIZATION: Build notification message with return to work details if applicable
+            let notificationMessage = `Case ${caseNumber} has been ${statusAction} and approved by ${clinicianName}. Worker: ${workerName}.`
+            if (status === 'return_to_work' && updates.return_to_work_duty_type && updates.return_to_work_date) {
+              const dutyTypeLabel = formatDutyTypeLabel(updates.return_to_work_duty_type)
+              const formattedReturnDate = formatReturnDateForNotification(updates.return_to_work_date)
+              notificationMessage += ` Duty Type: ${dutyTypeLabel}. Return Date: ${formattedReturnDate}.`
+            }
+            
             // Create notifications for all WHS users (batch insert)
             const notifications = whsUsers.map((whsUser: any) => ({
               user_id: whsUser.id,
               type: 'case_closed',
               title: `✅ Case ${statusLabel}`,
-              message: `Case ${caseNumber} has been ${statusAction} and approved by ${clinicianName}. Worker: ${workerName}.`,
+              message: notificationMessage,
               data: {
                 case_id: caseId,
                 case_number: caseNumber,
@@ -1255,6 +1383,10 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
                 approved_at: timestamp,
                 clinician_id: user.id,
                 clinician_name: clinicianName,
+                ...(status === 'return_to_work' && {
+                  return_to_work_duty_type: updates.return_to_work_duty_type,
+                  return_to_work_date: updates.return_to_work_date,
+                }),
               },
               is_read: false,
             }))
@@ -1285,11 +1417,19 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
               const statusLabel = status === 'closed' ? 'CLOSED' : 'RETURN TO WORK'
               const statusAction = status === 'closed' ? 'closed' : 'marked as return to work'
               
+              // OPTIMIZATION: Build notification message with return to work details if applicable
+              let supervisorNotificationMessage = `Case ${caseNumber} has been ${statusAction} and approved by ${clinicianName}. Worker: ${workerName}.`
+              if (status === 'return_to_work' && updates.return_to_work_duty_type && updates.return_to_work_date) {
+                const dutyTypeLabel = formatDutyTypeLabel(updates.return_to_work_duty_type)
+                const formattedReturnDate = formatReturnDateForNotification(updates.return_to_work_date)
+                supervisorNotificationMessage += ` Duty Type: ${dutyTypeLabel}. Return Date: ${formattedReturnDate}.`
+              }
+              
               const supervisorNotification = {
                 user_id: supervisor.id,
                 type: 'case_closed',
                 title: `✅ Case ${statusLabel}`,
-                message: `Case ${caseNumber} has been ${statusAction} and approved by ${clinicianName}. Worker: ${workerName}.`,
+                message: supervisorNotificationMessage,
                 data: {
                   case_id: caseId,
                   case_number: caseNumber,
@@ -1306,6 +1446,10 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
                   approved_at: timestamp,
                   clinician_id: user.id,
                   clinician_name: clinicianName,
+                  ...(status === 'return_to_work' && {
+                    return_to_work_duty_type: updates.return_to_work_duty_type,
+                    return_to_work_date: updates.return_to_work_date,
+                  }),
                 },
                 is_read: false,
               }
@@ -1316,8 +1460,6 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
 
               if (supervisorNotifyError) {
                 console.error('[PATCH /clinician/cases/:id/status] Error creating supervisor notification:', supervisorNotifyError)
-              } else {
-                console.log(`[PATCH /clinician/cases/:id/status] Created notification for supervisor ${supervisor.id} for case ${caseNumber} (${statusLabel})`)
               }
             }
           }
@@ -1335,6 +1477,86 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
     })
   } catch (error: any) {
     console.error('[PATCH /clinician/cases/:id/status] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Update case notes
+clinician.post('/cases/:id/notes', authMiddleware, requireRole(['clinician']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const caseId = c.req.param('id')
+    const { notes } = await c.req.json()
+
+    // SECURITY: Validate case ID format
+    if (!caseId || typeof caseId !== 'string' || caseId.length > 36) {
+      return c.json({ error: 'Invalid case ID format' }, 400)
+    }
+
+    // SECURITY: Validate notes
+    if (notes !== undefined && typeof notes !== 'string') {
+      return c.json({ error: 'Notes must be a string' }, 400)
+    }
+
+    // SECURITY: Sanitize and limit notes length
+    const sanitizedNotes = notes ? sanitizeString(notes, 10000) : null
+
+    const adminClient = getAdminClient()
+
+    // Verify case exists and belongs to this clinician
+    const { data: caseItem, error: caseError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, clinician_id, notes')
+      .eq('id', caseId)
+      .eq('clinician_id', user.id)
+      .single()
+
+    if (caseError || !caseItem) {
+      return c.json({ error: 'Case not found or not assigned to you' }, 404)
+    }
+
+    // Parse existing notes if they exist
+    let notesData: any = {}
+    if (caseItem.notes) {
+      try {
+        notesData = JSON.parse(caseItem.notes)
+      } catch {
+        // If notes is not JSON, preserve it
+        notesData = { original_notes: caseItem.notes, clinical_notes: sanitizedNotes }
+      }
+    }
+
+    // Update clinical notes
+    notesData.clinical_notes = sanitizedNotes
+    notesData.clinical_notes_updated_at = new Date().toISOString()
+    notesData.clinical_notes_updated_by = user.id
+
+    // Update case with new notes
+    const { data: updatedCase, error: updateError } = await adminClient
+      .from('worker_exceptions')
+      .update({
+        notes: JSON.stringify(notesData),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', caseId)
+      .select()
+      .single()
+
+    if (updateError) {
+      console.error('[POST /clinician/cases/:id/notes] Error:', updateError)
+      return c.json({ error: 'Failed to update notes', details: updateError.message }, 500)
+    }
+
+    return c.json({
+      case: updatedCase,
+      message: 'Notes updated successfully'
+    })
+  } catch (error: any) {
+    console.error('[POST /clinician/cases/:id/notes] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
   }
 })
@@ -1623,30 +1845,39 @@ clinician.get('/appointments', authMiddleware, requireRole(['clinician']), async
       )
     }
 
-    // Calculate statistics
-    const todayAppointments = formattedAppointments.filter((apt: any) => apt.appointmentDate === todayStr).length
+    // OPTIMIZATION: Calculate all statistics in a single loop instead of multiple filters
     const weekFromNow = new Date(today)
     weekFromNow.setDate(weekFromNow.getDate() + 7)
     const weekStr = formatDateString(weekFromNow)
-    const weekAppointments = formattedAppointments.filter((apt: any) => 
-      apt.appointmentDate >= todayStr && apt.appointmentDate <= weekStr
-    ).length
+    const currentMonth = todayStr.substring(0, 7) // YYYY-MM format
     
-    const monthFromNow = new Date(today)
-    monthFromNow.setMonth(monthFromNow.getMonth() + 1)
-    const monthStr = formatDateString(monthFromNow)
-    const completedThisMonth = formattedAppointments.filter((apt: any) => 
-      apt.status === 'completed' && apt.appointmentDate >= todayStr.substring(0, 7)
-    ).length
+    let todayAppointments = 0
+    let weekAppointments = 0
+    let completedThisMonth = 0
+    let cancelledThisMonth = 0
+    let confirmedCount = 0
+    let pendingCount = 0
+    let declinedCount = 0
     
-    const cancelledThisMonth = formattedAppointments.filter((apt: any) => 
-      apt.status === 'cancelled' && apt.appointmentDate >= todayStr.substring(0, 7)
-    ).length
-
-    // Status counts
-    const confirmedCount = formattedAppointments.filter((apt: any) => apt.status === 'confirmed').length
-    const pendingCount = formattedAppointments.filter((apt: any) => apt.status === 'pending').length
-    const declinedCount = formattedAppointments.filter((apt: any) => apt.status === 'declined').length
+    // Single loop for all statistics (O(n) instead of O(7n))
+    for (const apt of formattedAppointments) {
+      // Date-based counts
+      if (apt.appointmentDate === todayStr) {
+        todayAppointments++
+      }
+      if (apt.appointmentDate >= todayStr && apt.appointmentDate <= weekStr) {
+        weekAppointments++
+      }
+      if (apt.appointmentDate?.substring(0, 7) === currentMonth) {
+        if (apt.status === 'completed') completedThisMonth++
+        if (apt.status === 'cancelled') cancelledThisMonth++
+      }
+      
+      // Status-based counts
+      if (apt.status === 'confirmed') confirmedCount++
+      else if (apt.status === 'pending') pendingCount++
+      else if (apt.status === 'declined') declinedCount++
+    }
 
     return c.json({
       appointments: formattedAppointments,
@@ -2042,6 +2273,416 @@ clinician.delete('/appointments/:id', authMiddleware, requireRole(['clinician'])
   } catch (error: any) {
     console.error('[DELETE /clinician/appointments/:id] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Transcribe audio using Whisper API
+clinician.post('/transcribe', authMiddleware, requireRole(['clinician']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    // SECURITY: Validate request has audio file
+    let formData: FormData
+    try {
+      formData = await c.req.formData()
+    } catch (formError: any) {
+      console.error('[POST /clinician/transcribe] FormData parsing error:', formError)
+      return c.json({ 
+        error: 'Failed to parse form data', 
+        details: formError.message || 'Invalid request format. Please ensure the audio file is properly formatted.' 
+      }, 400)
+    }
+
+    const audioFile = formData.get('audio') as File | null
+
+    if (!audioFile) {
+      return c.json({ error: 'Audio file is required' }, 400)
+    }
+
+    // SECURITY: Validate file type
+    const allowedTypes = ['audio/webm', 'audio/mp3', 'audio/wav', 'audio/mpeg', 'audio/mp4', 'audio/x-m4a', 'audio/ogg', 'audio/flac']
+    if (!allowedTypes.includes(audioFile.type)) {
+      return c.json({ error: 'Invalid audio file type. Supported: webm, mp3, wav, mpeg, mp4, m4a, ogg, flac' }, 400)
+    }
+
+    // SECURITY: Validate file size (max 25MB for Whisper API)
+    const maxSize = 25 * 1024 * 1024 // 25MB
+    if (audioFile.size > maxSize) {
+      return c.json({ error: 'Audio file too large. Maximum size is 25MB' }, 400)
+    }
+
+    // Log file info for debugging
+    // NOTE: Frontend now sends optimized audio (16kHz mono) for cost efficiency
+    // This reduces file size by ~75% while maintaining excellent transcription quality
+    console.log(`[POST /clinician/transcribe] Processing optimized audio file: ${audioFile.size} bytes, type: ${audioFile.type}`)
+
+    // Import transcription function
+    const { transcribeAudio } = await import('../utils/openai.js')
+
+    // Pass the File object directly - the transcribeAudio function will handle conversion
+    // Transcribe audio
+    const transcription = await transcribeAudio(audioFile)
+
+    return c.json({
+      transcription,
+      message: 'Audio transcribed successfully'
+    })
+  } catch (error: any) {
+    console.error('[POST /clinician/transcribe] Error:', error)
+    
+    // Provide more specific error messages
+    if (error.message?.includes('timeout') || error.message?.includes('ETIMEDOUT')) {
+      return c.json({ 
+        error: 'Transcription timeout', 
+        details: 'The audio file is too long or the transcription service is taking too long. Please try with a shorter recording.' 
+      }, 504)
+    }
+    
+    if (error.message?.includes('API key')) {
+      return c.json({ 
+        error: 'Configuration error', 
+        details: 'OpenAI API key is not configured properly.' 
+      }, 500)
+    }
+
+    return c.json({ 
+      error: 'Transcription failed', 
+      details: error.message || 'Unknown error occurred during transcription' 
+    }, 500)
+  }
+})
+
+// Analyze transcription using OpenAI
+clinician.post('/analyze-transcription', authMiddleware, requireRole(['clinician']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const { transcription, context } = await c.req.json()
+
+    // SECURITY: Validate transcription input
+    if (!transcription || typeof transcription !== 'string' || transcription.trim().length === 0) {
+      return c.json({ error: 'Transcription text is required' }, 400)
+    }
+
+    // SECURITY: Validate transcription length (max 10,000 characters)
+    if (transcription.length > 10000) {
+      return c.json({ error: 'Transcription too long. Maximum length is 10,000 characters' }, 400)
+    }
+
+    // SECURITY: Validate context if provided
+    if (context && (typeof context !== 'string' || context.length > 500)) {
+      return c.json({ error: 'Context must be a string with maximum 500 characters' }, 400)
+    }
+
+    // Import analysis function
+    const { analyzeTranscription } = await import('../utils/openai.js')
+
+    // Analyze transcription
+    const analysis = await analyzeTranscription({
+      transcription: transcription.trim(),
+      context: context?.trim() || undefined
+    })
+
+    return c.json({
+      analysis,
+      message: 'Transcription analyzed successfully'
+    })
+  } catch (error: any) {
+    console.error('[POST /clinician/analyze-transcription] Error:', error)
+    return c.json({ 
+      error: 'Analysis failed', 
+      details: error.message || 'Unknown error' 
+    }, 500)
+  }
+})
+
+// Save transcription to database
+clinician.post('/transcriptions', authMiddleware, requireRole(['clinician']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const { 
+      transcription_text, 
+      analysis, 
+      recording_duration_seconds,
+      estimated_cost,
+      audio_file_size_bytes,
+      clinical_notes,
+      appointment_id
+    } = await c.req.json()
+
+    // SECURITY: Validate transcription text
+    if (!transcription_text || typeof transcription_text !== 'string' || transcription_text.trim().length === 0) {
+      return c.json({ error: 'Transcription text is required' }, 400)
+    }
+
+    // SECURITY: Validate transcription length (max 50,000 characters)
+    if (transcription_text.length > 50000) {
+      return c.json({ error: 'Transcription too long. Maximum length is 50,000 characters' }, 400)
+    }
+
+    // SECURITY: Validate optional fields
+    if (recording_duration_seconds !== undefined && (typeof recording_duration_seconds !== 'number' || recording_duration_seconds < 0)) {
+      return c.json({ error: 'Recording duration must be a non-negative number' }, 400)
+    }
+
+    if (estimated_cost !== undefined && (typeof estimated_cost !== 'number' || estimated_cost < 0)) {
+      return c.json({ error: 'Estimated cost must be a non-negative number' }, 400)
+    }
+
+    if (audio_file_size_bytes !== undefined && (typeof audio_file_size_bytes !== 'number' || audio_file_size_bytes < 0)) {
+      return c.json({ error: 'Audio file size must be a non-negative number' }, 400)
+    }
+
+    // SECURITY: Validate analysis if provided (must be object)
+    if (analysis !== undefined && (typeof analysis !== 'object' || Array.isArray(analysis) || analysis === null)) {
+      return c.json({ error: 'Analysis must be a valid object' }, 400)
+    }
+
+    // SECURITY: Validate clinical notes if provided
+    if (clinical_notes !== undefined && clinical_notes !== null && typeof clinical_notes !== 'string') {
+      return c.json({ error: 'Clinical notes must be a string' }, 400)
+    }
+
+    // SECURITY: Validate and sanitize clinical notes
+    const sanitizedClinicalNotes = clinical_notes ? sanitizeString(clinical_notes, 10000) : null
+
+    // SECURITY: Validate appointment_id if provided (must be UUID)
+    if (appointment_id !== undefined && appointment_id !== null) {
+      if (typeof appointment_id !== 'string' || appointment_id.length > 36) {
+        return c.json({ error: 'Invalid appointment ID format' }, 400)
+      }
+      
+      const adminClient = getAdminClient()
+      // Verify appointment exists and belongs to this clinician
+      const { data: appointment, error: appointmentError } = await adminClient
+        .from('appointments')
+        .select('id, clinician_id')
+        .eq('id', appointment_id)
+        .eq('clinician_id', user.id)
+        .single()
+
+      if (appointmentError || !appointment) {
+        return c.json({ error: 'Appointment not found or not authorized' }, 404)
+      }
+    }
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Ensure transcription is saved with the logged-in clinician's ID
+    // Insert transcription
+    const { data: transcription, error: insertError } = await adminClient
+      .from('transcriptions')
+      .insert({
+        clinician_id: user.id, // SECURITY: Always use logged-in user's ID
+        transcription_text: transcription_text.trim(),
+        analysis: analysis || null,
+        recording_duration_seconds: recording_duration_seconds || null,
+        estimated_cost: estimated_cost || null,
+        audio_file_size_bytes: audio_file_size_bytes || null,
+        clinical_notes: sanitizedClinicalNotes,
+        appointment_id: appointment_id || null,
+      })
+      .select()
+      .single()
+
+    if (insertError) {
+      console.error('[POST /clinician/transcriptions] Error:', insertError)
+      return c.json({ error: 'Failed to save transcription', details: insertError.message }, 500)
+    }
+
+    // SECURITY: Verify transcription was saved with correct clinician_id
+    if (transcription && transcription.clinician_id !== user.id) {
+      console.error(`[POST /clinician/transcriptions] SECURITY: Transcription saved with wrong clinician_id. Expected ${user.id}, got ${transcription.clinician_id}`)
+      return c.json({ error: 'Security error: Transcription not saved correctly' }, 500)
+    }
+
+    return c.json({
+      transcription,
+      message: 'Transcription saved successfully'
+    })
+  } catch (error: any) {
+    console.error('[POST /clinician/transcriptions] Error:', error)
+    return c.json({ 
+      error: 'Failed to save transcription', 
+      details: error.message || 'Unknown error' 
+    }, 500)
+  }
+})
+
+// Get transcriptions history
+clinician.get('/transcriptions', authMiddleware, requireRole(['clinician']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100)
+    const offset = parseInt(c.req.query('offset') || '0')
+
+    // SECURITY: Validate pagination
+    if (limit < 1 || limit > 100) {
+      return c.json({ error: 'Invalid limit. Must be between 1 and 100' }, 400)
+    }
+
+    if (offset < 0) {
+      return c.json({ error: 'Invalid offset. Must be >= 0' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Only get transcriptions for the logged-in clinician
+    // Get transcriptions for this clinician (ordered by most recent first)
+    const { data: transcriptions, error: fetchError } = await adminClient
+      .from('transcriptions')
+      .select('*')
+      .eq('clinician_id', user.id) // SECURITY: Filter by logged-in clinician's ID
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+
+    if (fetchError) {
+      console.error('[GET /clinician/transcriptions] Error:', fetchError)
+      return c.json({ error: 'Failed to fetch transcriptions', details: fetchError.message }, 500)
+    }
+
+    // SECURITY: Count only transcriptions for the logged-in clinician
+    // Get total count
+    const { count, error: countError } = await adminClient
+      .from('transcriptions')
+      .select('*', { count: 'exact', head: true })
+      .eq('clinician_id', user.id) // SECURITY: Count only logged-in clinician's transcriptions
+
+    if (countError) {
+      console.error('[GET /clinician/transcriptions] Count error:', countError)
+      // Don't fail the request if count fails
+    }
+
+    return c.json({
+      transcriptions: transcriptions || [],
+      total: count || 0,
+      limit,
+      offset
+    })
+  } catch (error: any) {
+    console.error('[GET /clinician/transcriptions] Error:', error)
+    return c.json({ 
+      error: 'Failed to fetch transcriptions', 
+      details: error.message || 'Unknown error' 
+    }, 500)
+  }
+})
+
+// Get single transcription by ID
+clinician.get('/transcriptions/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const transcriptionId = c.req.param('id')
+
+    // SECURITY: Validate transcription ID format (UUID)
+    if (!transcriptionId || typeof transcriptionId !== 'string' || transcriptionId.length > 36) {
+      return c.json({ error: 'Invalid transcription ID format' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Get transcription only if owned by the logged-in clinician
+    // Get transcription (only if owned by this clinician)
+    const { data: transcription, error: fetchError } = await adminClient
+      .from('transcriptions')
+      .select('*')
+      .eq('id', transcriptionId)
+      .eq('clinician_id', user.id) // SECURITY: Only allow access if owned by logged-in clinician
+      .single()
+
+    if (fetchError || !transcription) {
+      console.error(`[GET /clinician/transcriptions/:id] SECURITY: User ${user.id} attempted to access transcription ${transcriptionId} not owned by them`)
+      return c.json({ error: 'Transcription not found or unauthorized' }, 404)
+    }
+
+    // SECURITY: Double-check ownership
+    if (transcription.clinician_id !== user.id) {
+      console.error(`[GET /clinician/transcriptions/:id] SECURITY: User ${user.id} attempted to access transcription ${transcriptionId} owned by ${transcription.clinician_id}`)
+      return c.json({ error: 'Unauthorized access to transcription' }, 403)
+    }
+
+    return c.json({ transcription })
+  } catch (error: any) {
+    console.error('[GET /clinician/transcriptions/:id] Error:', error)
+    return c.json({ 
+      error: 'Failed to fetch transcription', 
+      details: error.message || 'Unknown error' 
+    }, 500)
+  }
+})
+
+// Delete transcription
+clinician.delete('/transcriptions/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const transcriptionId = c.req.param('id')
+
+    // SECURITY: Validate transcription ID format (UUID)
+    if (!transcriptionId || typeof transcriptionId !== 'string' || transcriptionId.length > 36) {
+      return c.json({ error: 'Invalid transcription ID format' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Verify transcription exists and is owned by logged-in clinician before deleting
+    const { data: existingTranscription, error: checkError } = await adminClient
+      .from('transcriptions')
+      .select('clinician_id')
+      .eq('id', transcriptionId)
+      .single()
+
+    if (checkError || !existingTranscription) {
+      console.error(`[DELETE /clinician/transcriptions/:id] SECURITY: User ${user.id} attempted to delete non-existent transcription ${transcriptionId}`)
+      return c.json({ error: 'Transcription not found' }, 404)
+    }
+
+    // SECURITY: Verify ownership before deletion
+    if (existingTranscription.clinician_id !== user.id) {
+      console.error(`[DELETE /clinician/transcriptions/:id] SECURITY: User ${user.id} attempted to delete transcription ${transcriptionId} owned by ${existingTranscription.clinician_id}`)
+      return c.json({ error: 'Unauthorized: Cannot delete transcription owned by another clinician' }, 403)
+    }
+
+    // Delete transcription (only if owned by this clinician)
+    const { error: deleteError } = await adminClient
+      .from('transcriptions')
+      .delete()
+      .eq('id', transcriptionId)
+      .eq('clinician_id', user.id) // SECURITY: Double-check ownership in delete query
+
+    if (deleteError) {
+      console.error('[DELETE /clinician/transcriptions/:id] Error:', deleteError)
+      return c.json({ error: 'Failed to delete transcription', details: deleteError.message }, 500)
+    }
+
+    return c.json({ message: 'Transcription deleted successfully' })
+  } catch (error: any) {
+    console.error('[DELETE /clinician/transcriptions/:id] Error:', error)
+    return c.json({ 
+      error: 'Failed to delete transcription', 
+      details: error.message || 'Unknown error' 
+    }, 500)
   }
 })
 

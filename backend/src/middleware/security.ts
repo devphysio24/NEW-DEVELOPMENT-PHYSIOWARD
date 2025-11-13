@@ -29,17 +29,25 @@ export async function securityHeaders(c: Context, next: Next) {
 /**
  * Request size limit middleware
  * Prevents large payload attacks
+ * Allows larger uploads for specific endpoints (e.g., audio transcription)
  */
 export async function requestSizeLimit(c: Context, next: Next) {
   const contentLength = c.req.header('content-length')
+  const path = c.req.path
   
-  // Limit request body to 1MB (1048576 bytes)
-  const maxSize = 1024 * 1024 // 1MB
+  // Determine max size based on endpoint
+  // Audio transcription endpoint needs up to 25MB (Whisper API limit)
+  // Add 5MB buffer for safety
+  const isTranscriptionEndpoint = path.includes('/transcribe')
+  const maxSize = isTranscriptionEndpoint 
+    ? 30 * 1024 * 1024 // 30MB for transcription
+    : 1024 * 1024 // 1MB for other endpoints
   
   if (contentLength && parseInt(contentLength) > maxSize) {
+    const maxSizeMB = Math.round(maxSize / (1024 * 1024))
     return c.json({ 
       error: 'Request too large',
-      message: 'Request body exceeds maximum size limit of 1MB'
+      message: `Request body exceeds maximum size limit of ${maxSizeMB}MB`
     }, 413)
   }
 

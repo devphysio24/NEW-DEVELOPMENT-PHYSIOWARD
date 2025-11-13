@@ -7,7 +7,7 @@ import { authMiddleware, requireRole, AuthVariables, COOKIE_NAMES } from '../mid
 import { sanitizeInput, isValidEmail, isValidName, isValidPassword } from '../middleware/security.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { ensureUserRecordExists } from '../utils/userUtils.js'
-import { generateUniqueQuickLoginCode, isValidQuickLoginCode } from '../utils/quickLoginCode.js'
+import { generateUniqueQuickLoginCode, isValidQuickLoginCode, generateUniquePinCode } from '../utils/quickLoginCode.js'
 
 // Helper function to set secure cookies
 function setSecureCookies(c: any, accessToken: string, refreshToken: string, expiresAt: number, userId: string) {
@@ -36,7 +36,6 @@ function setSecureCookies(c: any, accessToken: string, refreshToken: string, exp
     maxAge = 3600
   }
   
-  console.log(`[setSecureCookies] Setting cookies for user: ${userId}, sameSite: ${sameSite}, secure: ${secure}`)
   
   // Set access token cookie with proper expiration
   setCookie(c, COOKIE_NAMES.ACCESS_TOKEN, accessToken, {
@@ -67,7 +66,6 @@ function setSecureCookies(c: any, accessToken: string, refreshToken: string, exp
     path: '/',
   })
   
-  console.log(`[setSecureCookies] Cookies set successfully - access_token: ${accessToken.substring(0, 20)}..., refresh_token: ${refreshToken.substring(0, 20)}...`)
 }
 
 // Helper function to clear cookies securely
@@ -104,7 +102,6 @@ function clearCookies(c: any) {
     path: '/',
   })
   
-  console.log('[clearCookies] All cookies cleared securely for session')
 }
 
 const auth = new Hono<{ Variables: AuthVariables }>()
@@ -309,7 +306,6 @@ auth.post('/login', async (c) => {
       return c.json({ error: 'Email and password are required' }, 400)
     }
 
-    console.log(`[POST /login] Login attempt for email: ${email}`)
 
     // Try Supabase Auth first (simplest approach)
     let { data: authData, error: authError } = await supabase.auth.signInWithPassword({
@@ -345,7 +341,6 @@ auth.post('/login', async (c) => {
 
       // If still failed, return error
       if (authError || !authData?.session) {
-      console.log(`[POST /login] Login failed for email: ${email}, error: ${authError?.message}`)
       return c.json({ error: 'Invalid email or password' }, 401)
     }
     }
@@ -375,7 +370,6 @@ auth.post('/login', async (c) => {
       userData.id
     )
 
-    console.log(`[POST /login] Login successful for user: ${userData.id} (${userData.email})`)
 
     // Record login log (non-blocking - don't fail login if this fails)
     try {
@@ -429,15 +423,20 @@ auth.post('/quick-login', async (c) => {
       return c.json({ error: 'Quick login code is required' }, 400)
     }
 
-    // Validate code format (must be 6 digits)
+    // Validate code format (accepts 6 digits or lastname-number format)
     if (!isValidQuickLoginCode(quick_login_code)) {
-      return c.json({ error: 'Invalid quick login code format. Must be 6 digits.' }, 400)
+      return c.json({ error: 'Invalid quick login code format. Use 6 digits or lastname-number format (e.g., delapiedra-232939).' }, 400)
     }
 
     const trimmedCode = quick_login_code.trim()
 
-    // Log attempt (mask code for security - only show first 2 digits)
-    console.log(`[POST /quick-login] Quick login attempt for code: ${trimmedCode.substring(0, 2)}****`)
+    // Log attempt (mask code for security - show format but mask sensitive parts)
+    const isOldFormat = /^\d{6}$/.test(trimmedCode)
+    const maskedCode = isOldFormat 
+      ? `${trimmedCode.substring(0, 2)}****` 
+      : trimmedCode.includes('-') 
+        ? `${trimmedCode.split('-')[0]}-****` 
+        : `${trimmedCode.substring(0, 2)}****`
 
     // Find user by quick login code (workers only)
     // Optimized: Uses index on quick_login_code for fast lookup
@@ -454,7 +453,12 @@ auth.post('/quick-login', async (c) => {
 
     if (dbError || !userData) {
       // Log failure (mask code for security)
-      console.log(`[POST /quick-login] Quick login failed for code: ${trimmedCode.substring(0, 2)}****, error: ${dbError?.message || 'User not found'}`)
+      const isOldFormat = /^\d{6}$/.test(trimmedCode)
+      const maskedCode = isOldFormat 
+        ? `${trimmedCode.substring(0, 2)}****` 
+        : trimmedCode.includes('-') 
+          ? `${trimmedCode.split('-')[0]}-****` 
+          : `${trimmedCode.substring(0, 2)}****`
       
       // Record failed attempt (non-blocking)
       try {
@@ -515,7 +519,6 @@ auth.post('/quick-login', async (c) => {
     )
     
     // Session created and cookies set
-    console.log(`[POST /quick-login] Quick login successful for user: ${userData.id} (${userData.email})`)
 
     // Record login (non-blocking)
     try {
@@ -579,7 +582,6 @@ auth.post('/logout', async (c) => {
         if (user && !userError) {
           userId = user.id
           userEmail = user.email || 'unknown'
-          console.log(`[POST /logout] Logging out user: ${user.id} (${user.email})`)
           
           // SECURITY: Invalidate the refresh token on Supabase side
           // This ensures the session cannot be reused even if cookies are somehow recovered
@@ -611,7 +613,6 @@ auth.post('/logout', async (c) => {
         }
       } catch (e) {
         // Token might be expired, that's ok - we'll still clear cookies
-        console.log('[POST /logout] Token expired or invalid, proceeding with cookie cleanup')
       }
     }
     
@@ -646,7 +647,6 @@ auth.post('/logout', async (c) => {
       path: '/',
     })
     
-    console.log(`[POST /logout] Logout successful - cookies cleared and session invalidated for user: ${userId}`)
 
     return c.json({ 
       message: 'Logged out successfully',
@@ -806,16 +806,11 @@ auth.get('/me', async (c) => {
     const refreshToken = getCookie(c, COOKIE_NAMES.REFRESH_TOKEN)
     const userId = getCookie(c, COOKIE_NAMES.USER_ID)
 
-    // DEBUG: Log cookie status
-    console.log(`[GET /me] Cookie check - access_token: ${token ? 'present' : 'missing'} (${token ? token.substring(0, 20) + '...' : 'N/A'}), refresh_token: ${refreshToken ? 'present' : 'missing'}, user_id: ${userId || 'missing'}`)
-
     // SECURITY: If no valid tokens but user_id exists, clear stale cookies
     if (!token && !refreshToken) {
-      console.log('[GET /me] No authentication credentials found in cookies')
       
       // If user_id exists but no tokens, this is a stale session - clear it
       if (userId) {
-        console.log(`[GET /me] Stale session detected - user_id present but no tokens. Clearing stale cookies for user: ${userId}`)
         clearCookies(c)
       }
       
@@ -832,27 +827,21 @@ auth.get('/me', async (c) => {
       
       if (!tokenError && tokenUser) {
         user = tokenUser
-        console.log(`[GET /me] Token verified for user: ${tokenUser.id} (${tokenUser.email})`)
       } else if (tokenError) {
         // Token is invalid, will try to refresh below
-        console.log(`[GET /me] Access token invalid for token: ${currentToken.substring(0, 20)}..., error: ${tokenError.message}`)
         }
       } catch (networkError: any) {
         // Handle network errors (timeout, connection issues)
         console.warn(`[GET /me] Network error verifying token: ${networkError.message || 'Connection timeout'}`)
         // Continue to try refresh token below
       }
-    } else {
-      console.log('[GET /me] No access token found, will try refresh token')
     }
 
     // If token is invalid or missing, try to refresh
     if (!user && refreshToken) {
-      console.log(`[GET /me] Attempting to refresh token for refreshToken: ${refreshToken.substring(0, 20)}...`)
       const refreshedTokens = await refreshAccessToken(refreshToken)
 
       if (refreshedTokens) {
-        console.log(`[GET /me] Token refreshed successfully for user: ${refreshedTokens.user_id}`)
         // Set new cookies with refreshed tokens
         setSecureCookies(
           c,
@@ -869,7 +858,6 @@ auth.get('/me', async (c) => {
         if (!userError && refreshedUser) {
           user = refreshedUser
           currentToken = refreshedTokens.access_token
-          console.log(`[GET /me] Refreshed user verified: ${refreshedUser.id} (${refreshedUser.email})`)
           } else if (userError) {
             console.warn(`[GET /me] Error getting user after refresh: ${userError.message}`)
           // Token refresh worked but can't get user - clear cookies
@@ -900,25 +888,23 @@ auth.get('/me', async (c) => {
     // Get user role from database - try with regular client first
     let { data: userData, error: dbError } = await supabase
       .from('users')
-      .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number')
+      .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code')
       .eq('id', user.id)
       .single()
 
     // If query failed due to RLS or user not found, try with admin client
     if ((dbError || !userData) && user.email) {
-      console.log(`[GET /me] Regular query failed or user not found. Trying admin client: ${user.id}`)
       
       // Use admin client to bypass RLS and check if user actually exists
       const adminClient = getAdminClient()
       const { data: adminUserData, error: adminError } = await adminClient
         .from('users')
-        .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number')
+        .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code')
         .eq('id', user.id)
         .single()
 
       if (adminUserData) {
         // User exists in database - use their actual role
-        console.log(`[GET /me] User found in database via admin client with role: ${adminUserData.role}`)
         userData = adminUserData
       } else if (adminError && adminError.code === 'PGRST116') {
         // User truly doesn't exist in database - auto-create with default role
@@ -975,6 +961,7 @@ auth.get('/me', async (c) => {
         phone: null, // Phone is stored in team_members table, not users table
         business_name: userData.business_name || null,
         business_registration_number: userData.business_registration_number || null,
+        quick_login_code: userData.quick_login_code || null,
       },
     })
   } catch (error: any) {
@@ -1253,6 +1240,62 @@ auth.patch('/profile', authMiddleware, async (c) => {
     })
   } catch (error: any) {
     console.error('Update profile error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Generate quick login PIN (authenticated users only)
+auth.patch('/pin', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+
+    // Get current user data to get last_name
+    const { data: userData, error: userError } = await adminClient
+      .from('users')
+      .select('id, last_name, quick_login_code')
+      .eq('id', user.id)
+      .single()
+
+    if (userError || !userData) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    // Generate new PIN based on last name
+    if (!userData.last_name) {
+      return c.json({ error: 'Last name is required to generate PIN. Please update your profile first.' }, 400)
+    }
+
+    let newPin: string
+    try {
+      newPin = await generateUniquePinCode(userData.last_name)
+    } catch (error: any) {
+      return c.json({ error: error.message || 'Failed to generate PIN' }, 500)
+    }
+
+    // Update user's quick_login_code
+    const { data: updatedUser, error: updateError } = await adminClient
+      .from('users')
+      .update({ quick_login_code: newPin })
+      .eq('id', user.id)
+      .select('id, quick_login_code')
+      .single()
+
+    if (updateError || !updatedUser) {
+      console.error('Error updating PIN:', updateError)
+      return c.json({ error: 'Failed to update PIN', details: updateError?.message }, 500)
+    }
+
+    return c.json({
+      message: 'PIN generated successfully',
+      pin: newPin,
+    })
+  } catch (error: any) {
+    console.error('Generate PIN error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
   }
 })

@@ -48,3 +48,30 @@ export function parseDateString(dateStr: string): Date {
   return date
 }
 
+/**
+ * Normalize a date to start of day (00:00:00.000)
+ * Useful for consistent date comparisons
+ */
+export function normalizeDate(date: Date): Date {
+  const normalized = new Date(date)
+  normalized.setHours(0, 0, 0, 0)
+  return normalized
+}
+
+/**
+ * Check if a date is within a date range (inclusive)
+ * @param checkDate - Date to check
+ * @param startDate - Start of range
+ * @param endDate - End of range (null means no end)
+ * @returns true if checkDate is within range
+ */
+export function isDateInRange(checkDate: Date, startDate: Date, endDate: Date | null): boolean {
+  const normalizedCheck = normalizeDate(checkDate)
+  const normalizedStart = normalizeDate(startDate)
+  const normalizedEnd = endDate ? normalizeDate(endDate) : null
+  
+  if (normalizedCheck < normalizedStart) return false
+  if (normalizedEnd && normalizedCheck > normalizedEnd) return false
+  return true
+}
+

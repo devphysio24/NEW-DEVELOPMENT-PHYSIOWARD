@@ -3,7 +3,8 @@ import bcrypt from 'bcrypt'
 import { supabase } from '../lib/supabase.js'
 import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
 import { getAdminClient } from '../utils/adminClient.js'
-import { generateUniqueQuickLoginCode } from '../utils/quickLoginCode.js'
+import { generateUniquePinCode } from '../utils/quickLoginCode.js'
+import { formatDateString } from '../utils/dateTime.js'
 
 const teams = new Hono<{ Variables: AuthVariables }>()
 
@@ -151,29 +152,63 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
     
     // OPTIMIZATION: Batch fetch all user details in a single query (fixes N+1 problem)
     // This is much more efficient than fetching users one-by-one
-    const memberUserIds = (members || []).map((m: any) => m.user_id)
+    const memberUserIds = (members || []).map((m: any) => m.user_id).filter(Boolean)
     let userMap = new Map<string, any>()
     
     if (memberUserIds.length > 0) {
-      const { data: allUsers, error: usersError } = await adminClient
+      try {
+        const { data: allUsers, error: usersError } = await adminClient
           .from('users')
           .select('id, email, first_name, last_name, full_name, role')
-        .in('id', memberUserIds)
+          .in('id', memberUserIds)
         
-      if (usersError) {
-        console.error('[GET /teams] Error batch fetching users:', usersError)
-      } else if (allUsers) {
-        // Create lookup map for O(1) access
-        allUsers.forEach((user: any) => {
-          userMap.set(user.id, user)
-        })
-        
-        if (process.env.NODE_ENV === 'development') {
-          console.log(`[GET /teams] ✅ Batch fetched ${allUsers.length} users for ${memberUserIds.length} team members`)
+        if (usersError) {
+          console.error('[GET /teams] Error batch fetching users:', usersError)
+          // Continue with empty userMap - members will be filtered out later
+        } else if (allUsers) {
+          // Create lookup map for O(1) access
+          allUsers.forEach((user: any) => {
+            userMap.set(user.id, user)
+          })
+          
+          if (process.env.NODE_ENV === 'development') {
+            console.log(`[GET /teams] ✅ Batch fetched ${allUsers.length} users for ${memberUserIds.length} team members`)
+          }
         }
+      } catch (error) {
+        console.error('[GET /teams] Exception batch fetching users:', error)
+        // Continue with empty userMap - members will be filtered out later
       }
     }
     
+    // OPTIMIZATION: Get workers with schedules ONCE for all members
+    const workerIdsForScheduleCheck = memberUserIds
+    let workersWithSchedulesSet = new Set<string>()
+    
+    if (workerIdsForScheduleCheck.length > 0) {
+      try {
+        const { data: schedulesData, error: schedulesError } = await adminClient
+          .from('worker_schedules')
+          .select('worker_id')
+          .in('worker_id', workerIdsForScheduleCheck)
+          .eq('is_active', true)
+        
+        if (!schedulesError && schedulesData) {
+          schedulesData.forEach((s: any) => {
+            if (s.worker_id) {
+              workersWithSchedulesSet.add(s.worker_id)
+            }
+          })
+        } else if (schedulesError) {
+          console.error('[GET /teams] Error fetching schedules:', schedulesError)
+          // Continue with empty set - all workers will show as inactive
+        }
+      } catch (error) {
+        console.error('[GET /teams] Exception fetching schedules:', error)
+        // Continue with empty set - all workers will show as inactive
+      }
+    }
+
     // Map members to users using the lookup map
     const membersWithUsers = (members || []).map((member: any) => {
       const userData = userMap.get(member.user_id) || null
@@ -190,6 +225,7 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
         return {
           ...member,
         users: userData,
+        has_active_schedule: workersWithSchedulesSet.has(member.user_id), // Add schedule flag
         }
       })
     
@@ -486,9 +522,18 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
       created_at: new Date().toISOString(),
     }
 
-    // Auto-generate quick login code for workers
+    // Auto-generate quick login code for workers using lastname-number format
     if (role === 'worker') {
-      userInsertData.quick_login_code = await generateUniqueQuickLoginCode()
+      // Use last_name to generate PIN in format "lastname-number" (e.g., "delapiedra-232939")
+      if (trimmedLastName) {
+        try {
+          userInsertData.quick_login_code = await generateUniquePinCode(trimmedLastName)
+        } catch (error: any) {
+          console.error('Error generating PIN for worker:', error)
+          // If PIN generation fails, continue without it (user can generate later from profile)
+          // Don't fail the entire user creation
+        }
+      }
     }
 
     // Create user record in database using admin client (bypasses RLS)
@@ -682,6 +727,12 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
     }
 
     const memberId = c.req.param('memberId')
+    const { password } = await c.req.json()
+
+    // SECURITY: Validate password input
+    if (!password || typeof password !== 'string' || password.trim() === '') {
+      return c.json({ error: 'Password is required to delete team member' }, 400)
+    }
 
     // Verify team leader owns this team and get member's role
     const adminClient = getAdminClient()
@@ -689,7 +740,9 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
       .from('team_members')
       .select(`
         user_id,
+        team_id,
         teams!inner (
+          id,
           team_leader_id
         )
       `)
@@ -705,6 +758,46 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
       return c.json({ error: 'Team member not found or unauthorized' }, 404)
     }
 
+    // SECURITY: Verify team leader's password before deletion
+    const { data: teamLeaderUser, error: teamLeaderError } = await adminClient
+      .from('users')
+      .select('email, password_hash')
+      .eq('id', user.id)
+      .single()
+
+    if (teamLeaderError || !teamLeaderUser) {
+      console.error('[DELETE /teams/members/:memberId] Error fetching user:', teamLeaderError)
+      return c.json({ error: 'Failed to verify identity' }, 500)
+    }
+
+    let passwordValid = false
+
+    if (teamLeaderUser.password_hash) {
+      // Verify using stored password hash
+      passwordValid = await bcrypt.compare(password, teamLeaderUser.password_hash)
+    } else {
+      // If no password_hash, verify using Supabase Auth
+      try {
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+          email: teamLeaderUser.email,
+          password: password,
+        })
+        passwordValid = !signInError
+        // Sign out immediately to prevent session creation
+        if (passwordValid) {
+          await supabase.auth.signOut()
+        }
+      } catch (authError: any) {
+        console.error('[DELETE /teams/members/:memberId] Password verification error:', authError)
+        passwordValid = false
+      }
+    }
+
+    if (!passwordValid) {
+      console.error('[DELETE /teams/members/:memberId] Password verification failed for team leader:', user.email)
+      return c.json({ error: 'Invalid password. Please enter your correct password to delete this team member.' }, 401)
+    }
+
     // Get member's role to check if they are a worker
     const { data: userData, error: userError } = await adminClient
       .from('users')
@@ -716,12 +809,44 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
       return c.json({ error: 'Failed to fetch user data' }, 500)
     }
 
-    // Prevent team leaders from deleting workers - only admin can delete workers
-    if (userData.role === 'worker') {
-      return c.json({ error: 'Cannot remove worker. Only administrators can delete worker accounts.' }, 403)
+    // SECURITY: Check if member has active exceptions - prevent deletion if they do
+    const { data: activeExceptions, error: exceptionsError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, exception_type, reason')
+      .eq('user_id', member.user_id)
+      .eq('is_active', true)
+      .eq('team_id', member.team_id)
+
+    if (exceptionsError) {
+      console.error('[DELETE /teams/members/:memberId] Error checking exceptions:', exceptionsError)
+      return c.json({ error: 'Failed to check member exceptions' }, 500)
     }
 
-    // Remove from team (don't delete user, just remove from team)
+    if (activeExceptions && activeExceptions.length > 0) {
+      const exceptionTypes = activeExceptions.map((e: any) => e.exception_type).join(', ')
+      return c.json({ 
+        error: `Cannot delete team member. This member has ${activeExceptions.length} active exception(s): ${exceptionTypes}. Please close or resolve all active exceptions before deleting the member.` 
+      }, 403)
+    }
+
+    // If member is a worker, delete their schedules before removing from team
+    if (userData.role === 'worker') {
+      // Delete all worker schedules (both active and inactive)
+      const { error: deleteSchedulesError } = await adminClient
+        .from('worker_schedules')
+        .delete()
+        .eq('worker_id', member.user_id)
+        .eq('team_id', member.team_id)
+
+      if (deleteSchedulesError) {
+        console.error('[DELETE /teams/members/:memberId] Error deleting worker schedules:', deleteSchedulesError)
+        // Continue with member deletion even if schedule deletion fails
+      } else {
+        console.log(`[DELETE /teams/members/:memberId] Deleted all schedules for worker ${member.user_id}`)
+      }
+    }
+
+    // Remove from team (don't delete user account, just remove from team)
     const { error: deleteError } = await supabase
       .from('team_members')
       .delete()
@@ -730,6 +855,11 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
     if (deleteError) {
       return c.json({ error: 'Failed to remove member', details: deleteError.message }, 500)
     }
+
+    // Invalidate cache for analytics (since member removal affects analytics)
+    const { cache } = await import('../utils/cache.js')
+    const { CacheManager } = await import('../utils/cache.js')
+    cache.deleteByUserId(user.id, ['analytics'])
 
     return c.json({ message: 'Team member removed successfully' })
   } catch (error: any) {
@@ -882,6 +1012,58 @@ teams.get('/members/:memberId/exception', authMiddleware, requireRole(['team_lea
     return c.json({ exception: exception || null })
   } catch (error: any) {
     console.error('Get exception error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get all check-ins for a worker by user_id (team leader only)
+teams.get('/members/:userId/check-ins', authMiddleware, requireRole(['team_leader']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const userId = c.req.param('userId')
+    const startDate = c.req.query('startDate') || '2020-01-01'
+    const endDate = c.req.query('endDate') || new Date().toISOString().split('T')[0]
+    
+    const adminClient = getAdminClient()
+
+    // Get team member and verify team leader owns this team
+    const { data: member } = await adminClient
+      .from('team_members')
+      .select('user_id, team_id, teams(team_leader_id)')
+      .eq('user_id', userId)
+      .single()
+
+    if (!member) {
+      return c.json({ error: 'Team member not found' }, 404)
+    }
+
+    const team = Array.isArray(member.teams) ? member.teams[0] : member.teams
+    if (!team || team.team_leader_id !== user.id) {
+      return c.json({ error: 'Unauthorized' }, 403)
+    }
+
+    // Get all check-ins for this worker in the date range
+    const { data: checkIns, error } = await adminClient
+      .from('daily_checkins')
+      .select('*')
+      .eq('user_id', userId)
+      .gte('check_in_date', startDate)
+      .lte('check_in_date', endDate)
+      .order('check_in_date', { ascending: false })
+      .order('check_in_time', { ascending: false })
+
+    if (error) {
+      console.error('Error fetching check-ins:', error)
+      return c.json({ error: 'Failed to fetch check-ins', details: error.message }, 500)
+    }
+
+    return c.json({ checkIns: checkIns || [] })
+  } catch (error: any) {
+    console.error('Get check-ins error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
   }
 })
@@ -1829,10 +2011,14 @@ teams.get('/check-ins', authMiddleware, requireRole(['team_leader']), async (c) 
       .filter((exc: any) => activeWorkerIds.includes(exc.user_id))
 
     // Helper: Check if exception is active for a given date
-    // Note: This endpoint only fetches active exceptions (is_active = true), 
-    // but we still check deactivated_at for consistency and edge cases
-    const isExceptionActive = (exception: { start_date: string; end_date?: string | null; deactivated_at?: string | null }, checkDate: Date) => {
-      // If exception was deactivated before checkDate, it's not active
+    // IMPORTANT: Must check is_active field AND deactivated_at AND date range
+    const isExceptionActive = (exception: { start_date: string; end_date?: string | null; deactivated_at?: string | null; is_active?: boolean }, checkDate: Date) => {
+      // First check: exception must be marked as active in database
+      if (exception.is_active === false) {
+        return false
+      }
+      
+      // Second check: If exception was deactivated before checkDate, it's not active
       if (exception.deactivated_at) {
         const deactivatedDate = new Date(exception.deactivated_at)
         deactivatedDate.setHours(0, 0, 0, 0)
@@ -1842,8 +2028,15 @@ teams.get('/check-ins', authMiddleware, requireRole(['team_leader']), async (c) 
         }
       }
       
+      // Third check: checkDate must be within exception's date range
       const excStartDate = new Date(exception.start_date)
+      excStartDate.setHours(0, 0, 0, 0)
       const excEndDate = exception.end_date ? new Date(exception.end_date) : null
+      if (excEndDate) {
+        excEndDate.setHours(23, 59, 59, 999)
+      }
+      checkDate.setHours(0, 0, 0, 0)
+      
       return checkDate >= excStartDate && (!excEndDate || checkDate <= excEndDate)
     }
     
@@ -2012,6 +2205,11 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
     const workerIdsParam = c.req.query('workerIds')
     const workerIds = workerIdsParam ? workerIdsParam.split(',') : null
 
+    // Check if today is in the date range - if so, use shorter cache or bypass
+    // Use local date to avoid timezone issues
+    const today = formatDateString(new Date())
+    const todayInRange = today >= startDate && today <= endDate
+
     // Generate cache key
     const cacheKey = CacheManager.generateKey('analytics', {
       userId: user.id,
@@ -2020,12 +2218,13 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
       workerIds: workerIds?.join(',') || 'all',
     })
 
-    // Try to get from cache (5 minute TTL)
+    // If today is in range, use shorter cache TTL (1 minute) for fresher data
+    // Otherwise use normal 5 minute TTL
     const cached = cache.get(cacheKey)
     if (cached) {
       return c.json(cached, 200, {
         'X-Cache': 'HIT',
-        'Cache-Control': 'public, max-age=300',
+        'Cache-Control': todayInRange ? 'public, max-age=60' : 'public, max-age=300',
       })
     }
 
@@ -2074,7 +2273,7 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
     // We need this BEFORE filtering workers because exceptions determine if a worker should appear
     const { data: allExceptionsRaw, error: exceptionsError } = await adminClient
       .from('worker_exceptions')
-      .select('user_id, exception_type, reason, start_date, end_date, is_active, deactivated_at')
+      .select('id, user_id, exception_type, reason, start_date, end_date, is_active, deactivated_at')
       .in('user_id', allWorkerIds)
     
     if (exceptionsError) {
@@ -2207,31 +2406,37 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
     })
 
     // Helper function to check if exception is active on a specific date
-    // This uses deactivated_at timestamp to ensure historical accuracy
-    const isExceptionActiveOnDate = (exception: { start_date: string; end_date?: string | null; deactivated_at?: string | null }, checkDate: Date): boolean => {
-      // If exception was deactivated, check if deactivation was before or on the checkDate
+    // This uses deactivated_at timestamp and is_active field to ensure historical accuracy
+    const isExceptionActiveOnDate = (exception: { start_date: string; end_date?: string | null; deactivated_at?: string | null; is_active?: boolean }, checkDate: Date): boolean => {
+      // First check: exception must be marked as active in database
+      if (exception.is_active === false) {
+        return false
+      }
+      
+      // Create a copy of checkDate to avoid mutating the original
+      const checkDateCopy = new Date(checkDate)
+      checkDateCopy.setHours(0, 0, 0, 0)
+      
+      // Second check: If exception was deactivated, check if deactivation was before or on the checkDate
       if (exception.deactivated_at) {
         const deactivatedDate = new Date(exception.deactivated_at)
         deactivatedDate.setHours(0, 0, 0, 0)
-        checkDate.setHours(0, 0, 0, 0)
         // If deactivated before or on checkDate, exception was not active on that date
-        if (deactivatedDate < checkDate) {
-          return false
-        }
-        // If deactivated on the same day, we need to check if it was active during that day
-        // For simplicity, if deactivated on the same day, consider it inactive for analytics
-        if (deactivatedDate.getTime() === checkDate.getTime()) {
+        if (deactivatedDate <= checkDateCopy) {
           return false
         }
       }
       
-      // Check date range overlap
-      const startDate = new Date(exception.start_date)
-      startDate.setHours(0, 0, 0, 0)
-      const endDate = exception.end_date ? new Date(exception.end_date) : null
-      if (endDate) endDate.setHours(23, 59, 59, 999)
-      checkDate.setHours(0, 0, 0, 0)
-      return checkDate >= startDate && (!endDate || checkDate <= endDate)
+      // Third check: checkDate must be within exception's date range - use date strings to avoid timezone issues
+      const checkDateStr = formatDateString(checkDateCopy)
+      const startDateStr = exception.start_date
+      const endDateStr = exception.end_date || null
+      
+      // Compare date strings directly (YYYY-MM-DD format)
+      const isAfterStart = checkDateStr >= startDateStr
+      const isBeforeEnd = !endDateStr || checkDateStr <= endDateStr
+      
+      return isAfterStart && isBeforeEnd
     }
 
     // Create a map of exceptions by user_id for quick lookup
@@ -2283,7 +2488,13 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
       // Single-date schedule
       if (schedule.scheduled_date && (schedule.day_of_week === null || schedule.day_of_week === undefined)) {
         const scheduleDate = new Date(schedule.scheduled_date)
-        if (scheduleDate >= start && scheduleDate <= end) {
+        scheduleDate.setHours(0, 0, 0, 0) // Normalize to start of day for comparison
+        const startNormalized = new Date(start)
+        startNormalized.setHours(0, 0, 0, 0)
+        const endNormalized = new Date(end)
+        endNormalized.setHours(23, 59, 59, 999)
+        
+        if (scheduleDate >= startNormalized && scheduleDate <= endNormalized) {
           const dateStr = schedule.scheduled_date
           if (!schedulesByDate.has(dateStr)) {
             schedulesByDate.set(dateStr, new Set())
@@ -2293,24 +2504,51 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
       }
       // Recurring schedule: calculate all matching dates
       else if (schedule.day_of_week !== null && schedule.day_of_week !== undefined) {
-        const effectiveDate = schedule.effective_date ? new Date(schedule.effective_date) : start
-        const expiryDate = schedule.expiry_date ? new Date(schedule.expiry_date) : end
-        expiryDate.setHours(23, 59, 59, 999)
+        // Handle effective_date: if null, schedule is active from the start of query range
+        // If set, schedule is active from that date onwards
+        const effectiveDate = schedule.effective_date ? new Date(schedule.effective_date) : null
+        const expiryDate = schedule.expiry_date ? new Date(schedule.expiry_date) : null
         
-        const scheduleStart = effectiveDate > start ? effectiveDate : start
-        const scheduleEnd = expiryDate < end ? expiryDate : end
+        // Determine the actual start and end dates for this schedule
+        // Start: max of effective_date (if set) and query start, or just query start if no effective_date
+        const scheduleStart = effectiveDate && effectiveDate > start ? effectiveDate : start
         
+        // End: min of expiry_date (if set) and query end, or just query end if no expiry_date
+        const scheduleEnd = expiryDate && expiryDate < end ? expiryDate : end
+        
+        // Only process if schedule is active within the query range
+        if (scheduleStart <= scheduleEnd) {
         // Calculate all dates that match the day_of_week within the effective range
         for (let d = new Date(scheduleStart); d <= scheduleEnd; d.setDate(d.getDate() + 1)) {
           const dayOfWeek = d.getDay() // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
           
           // Check if this date matches the schedule's day_of_week
           if (dayOfWeek === schedule.day_of_week) {
-            const dateStr = d.toISOString().split('T')[0]
+              // Use local date string to avoid timezone issues (YYYY-MM-DD format)
+              const dateStr = formatDateString(d)
+              
+              // Also check if date is within effective_date and expiry_date (if set)
+              // Compare date strings directly (both in YYYY-MM-DD format)
+              let isAfterEffective = true
+              let isBeforeExpiry = true
+              
+              if (effectiveDate) {
+                const effDateStr = formatDateString(effectiveDate)
+                isAfterEffective = dateStr >= effDateStr
+              }
+              
+              if (expiryDate) {
+                const expDateStr = formatDateString(expiryDate)
+                isBeforeExpiry = dateStr <= expDateStr
+              }
+              
+              if (isAfterEffective && isBeforeExpiry) {
             if (!schedulesByDate.has(dateStr)) {
               schedulesByDate.set(dateStr, new Set())
             }
             schedulesByDate.get(dateStr)!.add(schedule.worker_id)
+              }
+            }
           }
         }
       }
@@ -2319,8 +2557,9 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
     // Count expected check-ins per day: only workers with schedules AND no exceptions
     let totalExpectedCheckIns = 0
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().split('T')[0]
-      const checkDate = new Date(dateStr)
+      // Use local date string to avoid timezone issues (YYYY-MM-DD format)
+      const dateStr = formatDateString(d)
+      const checkDate = new Date(d.getFullYear(), d.getMonth(), d.getDate())
       
       // Get workers with schedules on this date
       const workersWithScheduleOnDate = schedulesByDate.get(dateStr) || new Set()
@@ -2371,8 +2610,10 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
 
     // Initialize all dates in range (count workers with schedules per day, excluding exceptions)
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().split('T')[0]
-      const checkDate = new Date(dateStr)
+      // Use local date string to avoid timezone issues (YYYY-MM-DD format)
+      const dateStr = formatDateString(d)
+      // Create checkDate from local date components to avoid timezone issues
+      const checkDate = new Date(d.getFullYear(), d.getMonth(), d.getDate())
       
       // Get workers with schedules on this date
       const workersWithScheduleOnDate = schedulesByDate.get(dateStr) || new Set()
@@ -2457,7 +2698,8 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
       // Count days this worker had assigned schedule (from schedulesByDate map which includes both single-date and recurring) AND was active (without exceptions)
       let activeDaysForWorker = 0
       for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-        const dateStr = d.toISOString().split('T')[0]
+        // Use local date string to avoid timezone issues (YYYY-MM-DD format)
+        const dateStr = formatDateString(d)
         const checkDate = new Date(d)
         
         // Check if worker has schedule on this date (works for both single-date and recurring schedules)
@@ -2572,7 +2814,8 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
           const dayOfWeek = d.getDay()
           
           if (dayOfWeek === schedule.day_of_week) {
-            const dateStr = d.toISOString().split('T')[0]
+            // Use local date string to avoid timezone issues (YYYY-MM-DD format)
+            const dateStr = formatDateString(d)
             if (!prevSchedulesByDate.has(dateStr)) {
               prevSchedulesByDate.set(dateStr, new Set())
             }
@@ -2585,8 +2828,9 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
     // Calculate expected check-ins for previous period (only workers with schedules, excluding exceptions)
     let prevTotalExpected = 0
     for (let d = new Date(prevStart); d <= prevEnd; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().split('T')[0]
-      const checkDate = new Date(dateStr)
+      // Use local date string to avoid timezone issues (YYYY-MM-DD format)
+      const dateStr = formatDateString(d)
+      const checkDate = new Date(d.getFullYear(), d.getMonth(), d.getDate())
       
       // Get workers with schedules on this date
       const prevWorkersWithScheduleOnDate = prevSchedulesByDate.get(dateStr) || new Set()
@@ -2625,12 +2869,14 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
       weeklyPattern,
     }
 
-    // Store in cache (5 minute TTL)
-    cache.set(cacheKey, responseData, 5 * 60 * 1000)
+    // Store in cache - use shorter TTL (1 minute) if today is in range for fresher data
+    // Otherwise use normal 5 minute TTL
+    const cacheTTL = todayInRange ? 60 * 1000 : 5 * 60 * 1000
+    cache.set(cacheKey, responseData, cacheTTL)
 
     return c.json(responseData, 200, {
       'X-Cache': 'MISS',
-      'Cache-Control': 'public, max-age=300',
+      'Cache-Control': todayInRange ? 'public, max-age=60' : 'public, max-age=300',
     })
   } catch (error: any) {
     console.error('Get check-in analytics error:', error)

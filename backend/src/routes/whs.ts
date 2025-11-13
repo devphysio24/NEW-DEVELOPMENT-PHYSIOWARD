@@ -2,6 +2,11 @@ import { Hono } from 'hono'
 import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
 import { getCaseStatusFromNotes, mapCaseStatusToDisplay, CaseStatus } from '../utils/caseStatus.js'
 import { getAdminClient } from '../utils/adminClient.js'
+import { normalizeDate, isDateInRange } from '../utils/dateTime.js'
+
+// OPTIMIZATION: Constants for active case statuses (avoid recreating array)
+const ACTIVE_CASE_STATUSES = ['new', 'triaged', 'assessed', 'in_rehab'] as const
+const COMPLETED_CASE_STATUSES = ['closed', 'return_to_work'] as const
 
 const whs = new Hono<{ Variables: AuthVariables }>()
 
@@ -76,8 +81,10 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
     const filterStatus = status || 'active' // Default to active
     
     if (filterStatus === 'active') {
-      query = query.eq('is_active', true).gte('start_date', todayStr).or(`end_date.is.null,end_date.gte.${todayStr}`)
-      countQuery = countQuery.eq('is_active', true).gte('start_date', todayStr).or(`end_date.is.null,end_date.gte.${todayStr}`)
+      // OPTIMIZATION: Use broader filter for active - will refine by case status from notes
+      // Include all cases that might be active (is_active = true OR cases with in_rehab status)
+      query = query.eq('is_active', true)
+      countQuery = countQuery.eq('is_active', true)
     } else if (filterStatus === 'closed') {
       query = query.or(`end_date.lt.${todayStr},is_active.eq.false`)
       countQuery = countQuery.or(`end_date.lt.${todayStr},is_active.eq.false`)
@@ -202,11 +209,7 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
       const teamLeader = team?.team_leader_id ? userMap.get(team.team_leader_id) : null
       const clinician = Array.isArray(incident.clinician) ? incident.clinician[0] : incident.clinician
 
-      const startDate = new Date(incident.start_date)
-      const endDate = incident.end_date ? new Date(incident.end_date) : null
-      const isCurrentlyActive = todayDate >= startDate && (!endDate || todayDate <= endDate) && incident.is_active
-
-      // OPTIMIZATION: Parse notes once and reuse for both case_status and approval info
+      // OPTIMIZATION: Parse notes first to get case status (needed for isCurrentlyActive calculation)
       let notesData: any = null
       let caseStatusFromNotes: CaseStatus | null = null
       let approvedBy: string | null = null
@@ -226,6 +229,21 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
           }
         } catch {
           // Notes is not JSON, ignore - caseStatusFromNotes will remain null
+        }
+      }
+
+      const startDate = new Date(incident.start_date)
+      const endDate = incident.end_date ? new Date(incident.end_date) : null
+      // OPTIMIZATION: For in_rehab cases, is_active flag is the primary indicator
+      // For other cases, check date range as well
+      let isCurrentlyActive = false
+      if (incident.is_active) {
+        if (caseStatusFromNotes === 'in_rehab') {
+          // For in_rehab, is_active = true means it's active (date range is less important)
+          isCurrentlyActive = true
+        } else {
+          // For other cases, check date range using utility function
+          isCurrentlyActive = isDateInRange(todayDate, startDate, endDate)
         }
       }
 
@@ -293,8 +311,44 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
         updatedAt: incident.updated_at,
         approvedBy,
         approvedAt,
+        returnToWorkDutyType: incident.return_to_work_duty_type || null,
+        returnToWorkDate: incident.return_to_work_date || null,
+        // OPTIMIZATION: Store internal case status for filtering
+        _caseStatus: caseStatusFromNotes || 'new',
       }
     })
+
+    // OPTIMIZATION: Apply status filter based on case status from notes (more accurate)
+    if (filterStatus === 'active') {
+      // Filter to show only active statuses: new, triaged, assessed, in_rehab
+      formattedCases = formattedCases.filter(caseItem => {
+        const caseStatus = (caseItem as any)._caseStatus || 'new'
+        
+        // Check if status is active
+        if (!ACTIVE_CASE_STATUSES.includes(caseStatus as typeof ACTIVE_CASE_STATUSES[number])) {
+          return false
+        }
+        
+        // For in_rehab cases, be more lenient - just check is_active flag
+        if (caseStatus === 'in_rehab') {
+          return caseItem.isActive === true
+        }
+        
+        // For other active statuses, check is_active and date range
+        if (!caseItem.isActive) return false
+        
+        // Check date range using utility function
+        const startDate = new Date(caseItem.startDate)
+        const endDate = caseItem.endDate ? new Date(caseItem.endDate) : null
+        return isDateInRange(todayDate, startDate, endDate)
+      })
+    } else if (filterStatus === 'closed') {
+      // Filter to show only completed statuses: closed, return_to_work
+      formattedCases = formattedCases.filter(caseItem => {
+        const caseStatus = (caseItem as any)._caseStatus || 'new'
+        return COMPLETED_CASE_STATUSES.includes(caseStatus as typeof COMPLETED_CASE_STATUSES[number])
+      })
+    }
 
     // Apply search filter
     if (search.trim()) {
@@ -344,9 +398,10 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
     }
 
     // Get summary statistics (only for assigned incidents)
+    // OPTIMIZATION: Include notes field to get accurate case status
     const { data: allCases, error: summaryError } = await adminClient
       .from('worker_exceptions')
-      .select('id, exception_type, is_active, start_date, end_date, created_at')
+      .select('id, exception_type, is_active, start_date, end_date, created_at, notes')
       .in('exception_type', incidentTypes)
       .eq('assigned_to_whs', true) // Only count incidents assigned by supervisor
 
@@ -367,24 +422,51 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
       byType: {} as Record<string, number>,
     }
 
+    // OPTIMIZATION: Use case status utilities (already imported at top)
+
     ;(allCases || []).forEach((caseItem: any) => {
       // Count by type
       const typeKey = caseItem.exception_type || 'other'
       summary.byType[typeKey] = (summary.byType[typeKey] || 0) + 1
 
-      // Check status
-      const startDate = new Date(caseItem.start_date)
-      const endDate = caseItem.end_date ? new Date(caseItem.end_date) : null
-      const isCurrentlyActive = todayDateObj >= startDate && (!endDate || todayDateObj <= endDate) && caseItem.is_active
+      // Get case status from notes (more accurate than just is_active)
+      const caseStatus = getCaseStatusFromNotes(caseItem.notes) || 'new'
       
-      if (isCurrentlyActive) {
-        const createdAt = new Date(caseItem.created_at)
-        if (createdAt >= weekAgo) {
-          summary.new++
+      // Check if case is new (created within last 7 days)
+      const createdAt = new Date(caseItem.created_at)
+      if (createdAt >= weekAgo) {
+        summary.new++
+      }
+
+      // Count active cases: status is new, triaged, assessed, or in_rehab AND is_active = true
+      const isActiveStatus = ACTIVE_CASE_STATUSES.includes(caseStatus as typeof ACTIVE_CASE_STATUSES[number])
+      
+      // For active status cases, check if they should be counted as active
+      if (isActiveStatus && caseItem.is_active) {
+        if (caseStatus === 'in_rehab') {
+          // in_rehab cases are active if is_active = true (date range check is optional)
+          summary.active++
+        } else {
+          // Other active statuses need to be within date range using utility function
+          const startDate = new Date(caseItem.start_date)
+          const endDate = caseItem.end_date ? new Date(caseItem.end_date) : null
+          if (isDateInRange(todayDateObj, startDate, endDate)) {
+            summary.active++
+          } else {
+            // Active status but outside date range - still count as active if is_active = true
+            // (might be a data issue, but we'll count it)
+            summary.active++
+          }
         }
-        summary.active++
-      } else {
+      } else if (COMPLETED_CASE_STATUSES.includes(caseStatus as typeof COMPLETED_CASE_STATUSES[number])) {
+        // Count completed cases: status is closed or return_to_work
         summary.completed++
+      } else if (!caseItem.is_active) {
+        // is_active = false means completed (legacy cases without status in notes)
+        summary.completed++
+      } else {
+        // Default to active if status is unknown but is_active = true
+        summary.active++
       }
     })
 
@@ -770,8 +852,7 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
     }
 
     const cases = allCases || []
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
+    const today = normalizeDate(new Date())
 
     // Calculate date ranges
     let startDate: Date
@@ -785,6 +866,7 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
       // month (default)
       startDate = new Date(today.getFullYear(), today.getMonth(), 1)
     }
+    startDate = normalizeDate(startDate)
 
     // Filter cases within range
     const rangeCases = cases.filter((caseItem: any) => {
@@ -792,20 +874,37 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
       return createdAt >= startDate
     })
 
-    // Calculate summary metrics
+    // OPTIMIZATION: Calculate active cases using case status from notes (more accurate)
     const totalCases = cases.length
     const activeCases = cases.filter((c: any) => {
+      const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+      const isActiveStatus = ACTIVE_CASE_STATUSES.includes(caseStatus as typeof ACTIVE_CASE_STATUSES[number])
+      
+      if (!isActiveStatus || !c.is_active) return false
+      
+      // For in_rehab cases, count as active if is_active = true
+      if (caseStatus === 'in_rehab') {
+        return true
+      }
+      
+      // For other active statuses, check date range
       const start = new Date(c.start_date)
       const end = c.end_date ? new Date(c.end_date) : null
-      return c.is_active && today >= start && (!end || today <= end)
+      return isDateInRange(today, start, end)
     }).length
 
     const newCases = rangeCases.length
 
-    // Calculate average resolution time (for closed cases)
+    // OPTIMIZATION: Calculate closed cases using case status from notes (more accurate)
     const closedCases = cases.filter((c: any) => {
+      const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+      // Count as closed if status is closed or return_to_work
+      if (COMPLETED_CASE_STATUSES.includes(caseStatus as typeof COMPLETED_CASE_STATUSES[number])) {
+        return true
+      }
+      // Legacy: also count if is_active = false or past end_date
       const end = c.end_date ? new Date(c.end_date) : null
-      return !c.is_active || (end && end < today)
+      return !c.is_active || (end && normalizeDate(end) < today)
     })
 
     let avgResolutionTime = 0
@@ -826,42 +925,37 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
     const casesWithClinician = cases.filter((c: any) => c.clinician_id).length
     const clinicianAssignment = totalCases > 0 ? Math.round((casesWithClinician / totalCases) * 100) : 0
 
-    // Closed this period
+    // OPTIMIZATION: Closed this period using case status from notes
     const closedThisPeriod = rangeCases.filter((c: any) => {
+      const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+      if (COMPLETED_CASE_STATUSES.includes(caseStatus as typeof COMPLETED_CASE_STATUSES[number])) {
+        const end = c.end_date ? new Date(c.end_date) : null
+        if (!end) return true // Closed status without end_date counts
+        return normalizeDate(end) >= startDate && normalizeDate(end) <= today
+      }
+      // Legacy: also check is_active and end_date
       const end = c.end_date ? new Date(c.end_date) : null
-      return (!c.is_active || (end && end >= startDate && end <= today))
+      return (!c.is_active || (end && normalizeDate(end) >= startDate && normalizeDate(end) <= today))
     }).length
 
     // Upcoming deadlines (cases ending in next 7 days)
-    const sevenDaysFromNow = new Date(today)
+    const sevenDaysFromNow = normalizeDate(new Date(today))
     sevenDaysFromNow.setDate(sevenDaysFromNow.getDate() + 7)
     const upcomingDeadlines = cases.filter((c: any) => {
-      if (!c.end_date) return false
-      const end = new Date(c.end_date)
-      return end >= today && end <= sevenDaysFromNow && c.is_active
+      if (!c.end_date || !c.is_active) return false
+      const end = normalizeDate(new Date(c.end_date))
+      return end >= today && end <= sevenDaysFromNow
     }).length
 
     // Overdue tasks (cases past end date but still active)
     const overdueTasks = cases.filter((c: any) => {
       if (!c.end_date || !c.is_active) return false
-      const end = new Date(c.end_date)
+      const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+      // Only count as overdue if not in_rehab (in_rehab cases can extend past end_date)
+      if (caseStatus === 'in_rehab') return false
+      const end = normalizeDate(new Date(c.end_date))
       return end < today
     }).length
-
-    // Get case statuses from notes
-    const getStatusFromNotes = (notes: string | null): string => {
-      if (!notes) return 'open'
-      try {
-        const notesData = JSON.parse(notes)
-        const status = notesData.case_status
-        if (['new', 'triaged', 'assessed', 'in_rehab', 'return_to_work', 'closed'].includes(status)) {
-          return status
-        }
-      } catch {
-        // Not JSON, ignore
-      }
-      return 'open'
-    }
 
     // Cases by status
     const casesByStatus = {
@@ -873,9 +967,10 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
       returnToWork: 0,
     }
 
+    // OPTIMIZATION: Use centralized getCaseStatusFromNotes utility
     cases.forEach((c: any) => {
-      const status = getStatusFromNotes(c.notes)
-      if (status === 'new' || status === 'open') {
+      const status = getCaseStatusFromNotes(c.notes) || 'new'
+      if (status === 'new') {
         casesByStatus.open++
       } else if (status === 'triaged') {
         casesByStatus.triaged++
@@ -888,6 +983,7 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
       } else if (status === 'return_to_work') {
         casesByStatus.returnToWork++
       } else {
+        // Default to open for unknown statuses
         casesByStatus.open++
       }
     })
@@ -905,28 +1001,39 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
         dateEnd.setHours(23, 59, 59, 999)
         const dateStr = date.toLocaleDateString('en-US', { weekday: 'short' })
         
-        // New cases created on this day
+        // OPTIMIZATION: New cases created on this day
         const dayCases = cases.filter((c: any) => {
-          const created = new Date(c.created_at)
-          created.setHours(0, 0, 0, 0)
+          const created = normalizeDate(new Date(c.created_at))
           return created.getTime() === date.getTime()
         }).length
         
-        // Closed cases on this day
+        // OPTIMIZATION: Closed cases on this day using case status from notes
         const dayClosed = cases.filter((c: any) => {
+          const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+          // Check if case was closed on this day
+          if (COMPLETED_CASE_STATUSES.includes(caseStatus as typeof COMPLETED_CASE_STATUSES[number])) {
+            const end = c.end_date ? normalizeDate(new Date(c.end_date)) : null
+            if (end && end.getTime() === date.getTime()) return true
+          }
+          // Legacy: also check end_date
           if (!c.end_date) return false
-          const end = new Date(c.end_date)
-          end.setHours(0, 0, 0, 0)
+          const end = normalizeDate(new Date(c.end_date))
           return end.getTime() === date.getTime()
         }).length
         
-        // Active cases on this day
+        // OPTIMIZATION: Active cases on this day using case status from notes
         const dayActive = cases.filter((c: any) => {
+          const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+          const isActiveStatus = ACTIVE_CASE_STATUSES.includes(caseStatus as typeof ACTIVE_CASE_STATUSES[number])
+          if (!isActiveStatus || !c.is_active) return false
+          
+          // For in_rehab cases, count as active if is_active = true
+          if (caseStatus === 'in_rehab') return true
+          
+          // For other active statuses, check date range
           const start = new Date(c.start_date)
-          start.setHours(0, 0, 0, 0)
           const end = c.end_date ? new Date(c.end_date) : null
-          if (end) end.setHours(0, 0, 0, 0)
-          return c.is_active && date >= start && (!end || date <= end)
+          return isDateInRange(date, start, end)
         }).length
 
         caseTrends.push({
@@ -964,18 +1071,33 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
           return created >= weekStart && created <= weekEnd
         }).length
         
-        // Closed cases in this week
+        // OPTIMIZATION: Closed cases in this week using case status from notes
         const weekClosed = cases.filter((c: any) => {
+          const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+          // Check if case was closed in this week
+          if (COMPLETED_CASE_STATUSES.includes(caseStatus as typeof COMPLETED_CASE_STATUSES[number])) {
+            const end = c.end_date ? new Date(c.end_date) : null
+            if (end && end >= weekStart && end <= weekEnd) return true
+          }
+          // Legacy: also check end_date
           if (!c.end_date) return false
           const end = new Date(c.end_date)
           return end >= weekStart && end <= weekEnd
         }).length
         
-        // Active cases at the end of this week
+        // OPTIMIZATION: Active cases at the end of this week using case status from notes
         const weekActive = cases.filter((c: any) => {
+          const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+          const isActiveStatus = ACTIVE_CASE_STATUSES.includes(caseStatus as typeof ACTIVE_CASE_STATUSES[number])
+          if (!isActiveStatus || !c.is_active) return false
+          
+          // For in_rehab cases, count as active if is_active = true
+          if (caseStatus === 'in_rehab') return true
+          
+          // For other active statuses, check date range
           const start = new Date(c.start_date)
           const end = c.end_date ? new Date(c.end_date) : null
-          return c.is_active && weekEnd >= start && (!end || weekEnd <= end)
+          return isDateInRange(weekEnd, start, end)
         }).length
 
         caseTrends.push({
@@ -996,24 +1118,39 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
         // Don't show future months
         if (monthStart > today) break
         
-        // New cases created in this month
+        // OPTIMIZATION: New cases created in this month
         const monthCases = cases.filter((c: any) => {
           const created = new Date(c.created_at)
           return created >= monthStart && created <= monthEnd
         }).length
         
-        // Closed cases in this month
+        // OPTIMIZATION: Closed cases in this month using case status from notes
         const monthClosed = cases.filter((c: any) => {
+          const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+          // Check if case was closed in this month
+          if (COMPLETED_CASE_STATUSES.includes(caseStatus as typeof COMPLETED_CASE_STATUSES[number])) {
+            const end = c.end_date ? new Date(c.end_date) : null
+            if (end && end >= monthStart && end <= monthEnd) return true
+          }
+          // Legacy: also check end_date
           if (!c.end_date) return false
           const end = new Date(c.end_date)
           return end >= monthStart && end <= monthEnd
         }).length
         
-        // Active cases at the end of this month
+        // OPTIMIZATION: Active cases at the end of this month using case status from notes
         const monthActive = cases.filter((c: any) => {
+          const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+          const isActiveStatus = ACTIVE_CASE_STATUSES.includes(caseStatus as typeof ACTIVE_CASE_STATUSES[number])
+          if (!isActiveStatus || !c.is_active) return false
+          
+          // For in_rehab cases, count as active if is_active = true
+          if (caseStatus === 'in_rehab') return true
+          
+          // For other active statuses, check date range
           const start = new Date(c.start_date)
           const end = c.end_date ? new Date(c.end_date) : null
-          return c.is_active && monthEnd >= start && (!end || monthEnd <= end)
+          return isDateInRange(monthEnd, start, end)
         }).length
 
         caseTrends.push({
@@ -1095,10 +1232,19 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
     const supervisorStats = Array.from(supervisorStatsMap.entries())
       .map(([supervisorId, stats]) => {
         const supervisor = supervisorDetailsMap.get(supervisorId)
+        // OPTIMIZATION: Active cases count using case status from notes
         const activeCasesCount = stats.cases.filter((c: any) => {
+          const caseStatus = getCaseStatusFromNotes(c.notes) || 'new'
+          const isActiveStatus = ACTIVE_CASE_STATUSES.includes(caseStatus as typeof ACTIVE_CASE_STATUSES[number])
+          if (!isActiveStatus || !c.is_active) return false
+          
+          // For in_rehab cases, count as active if is_active = true
+          if (caseStatus === 'in_rehab') return true
+          
+          // For other active statuses, check date range
           const start = new Date(c.start_date)
           const end = c.end_date ? new Date(c.end_date) : null
-          return c.is_active && today >= start && (!end || today <= end)
+          return isDateInRange(today, start, end)
         }).length
         
         return {
