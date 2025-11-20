@@ -1,12 +1,17 @@
 /**
  * Get SameSite cookie value for authentication
- * Mobile uses 'Lax' (more compatible), desktop production uses 'None' (cross-origin)
+ * In production (cross-origin), always use 'None' for both mobile and desktop
+ * In development (same-origin), use 'Lax'
  */
 export function getCookieSameSite(userAgent: string | undefined): 'None' | 'Lax' {
   const isProduction = process.env.NODE_ENV === 'production'
-  const isMobile = userAgent ? /Mobile|Android|iPhone|iPad|iPod/i.test(userAgent) : false
   
-  if (isMobile || !isProduction) return 'Lax'
-  return 'None'
+  // In production, frontend (Vercel) and backend (Render) are different domains
+  // So we need SameSite=None for cross-origin cookies to work
+  // This applies to both mobile and desktop
+  if (isProduction) return 'None'
+  
+  // In development, same-origin, so Lax is fine
+  return 'Lax'
 }
 

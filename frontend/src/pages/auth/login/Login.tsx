@@ -67,11 +67,39 @@ export function Login() {
 
       // Show success toast before redirecting
       showToastMessage('Login successful! Redirecting...', 'success')
+      
+      // Set role immediately
       setRole(result.data.user.role)
-      await refreshAuth()
+      
+      // Try to refresh auth, but don't fail if it doesn't work
+      try {
+        await refreshAuth()
+      } catch (err) {
+        console.warn('Refresh auth failed, but continuing with login:', err)
+      }
+      
+      // Get dashboard route
+      const dashboardRoute = getDashboardRoute(result.data.user.role as any)
+      if (!dashboardRoute) {
+        console.error('Invalid role for dashboard route:', result.data.user.role)
+        showToastMessage('Invalid user role. Please contact administrator.', 'error')
+        setLoading(false)
+        return
+      }
+      
+      // Detect mobile device
+      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+      
+      // Small delay to ensure cookies are set
       await new Promise(resolve => setTimeout(resolve, 500))
       
-      navigate(getDashboardRoute(result.data.user.role as any), { replace: true })
+      // On mobile, use window.location for more reliable navigation
+      // This ensures cookies are properly sent and page fully reloads
+      if (isMobile) {
+        window.location.href = dashboardRoute
+      } else {
+        navigate(dashboardRoute, { replace: true })
+      }
     } catch (err: any) {
       console.error('Login error:', err)
       showToastMessage('Failed to sign in. Please try again.', 'error')
@@ -112,11 +140,39 @@ export function Login() {
 
       // Show success toast before redirecting
       showToastMessage('Login successful! Redirecting...', 'success')
+      
+      // Set role immediately
       setRole(result.data.user.role)
-      await refreshAuth()
+      
+      // Try to refresh auth, but don't fail if it doesn't work
+      try {
+        await refreshAuth()
+      } catch (err) {
+        console.warn('Refresh auth failed, but continuing with login:', err)
+      }
+      
+      // Get dashboard route
+      const dashboardRoute = getDashboardRoute(result.data.user.role as any)
+      if (!dashboardRoute) {
+        console.error('Invalid role for dashboard route:', result.data.user.role)
+        showToastMessage('Invalid user role. Please contact administrator.', 'error')
+        setLoading(false)
+        return
+      }
+      
+      // Detect mobile device
+      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+      
+      // Small delay to ensure cookies are set
       await new Promise(resolve => setTimeout(resolve, 500))
       
-      navigate(getDashboardRoute(result.data.user.role as any), { replace: true })
+      // On mobile, use window.location for more reliable navigation
+      // This ensures cookies are properly sent and page fully reloads
+      if (isMobile) {
+        window.location.href = dashboardRoute
+      } else {
+        navigate(dashboardRoute, { replace: true })
+      }
     } catch (err: any) {
       console.error('Quick login error:', err)
       showToastMessage('Failed to sign in. Please try again.', 'error')
