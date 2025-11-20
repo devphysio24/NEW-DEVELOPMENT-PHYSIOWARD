@@ -15,3 +15,15 @@ export function getCookieSameSite(userAgent: string | undefined): 'None' | 'Lax'
   return 'Lax'
 }
 
+/**
+ * Check if Partitioned attribute should be used
+ * Required for SameSite=None; Secure cookies in modern browsers to prevent blocking
+ * See: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie#partitioned
+ */
+export function shouldUsePartitioned(): boolean {
+  const isProduction = process.env.NODE_ENV === 'production'
+  // Only use Partitioned in production when SameSite=None (cross-origin)
+  // This prevents cookies from being blocked by modern browsers
+  return isProduction
+}
+
