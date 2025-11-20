@@ -900,6 +900,7 @@ auth.get('/me', async (c) => {
             ...autoCreatedUser,
             business_name: null,
             business_registration_number: null,
+            quick_login_code: null,
           }
         }
       } else {
