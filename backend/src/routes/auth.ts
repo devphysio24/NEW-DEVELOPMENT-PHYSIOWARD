@@ -373,6 +373,14 @@ auth.post('/login', async (c) => {
     }
 
     // Set secure cookies
+    const userAgent = c.req.header('user-agent') || 'unknown'
+    const isProduction = process.env.NODE_ENV === 'production'
+    const sameSite = getCookieSameSite(userAgent)
+    const secure = isProduction
+    
+    console.log(`[LOGIN] Setting cookies - UserAgent: ${userAgent.substring(0, 50)}...`)
+    console.log(`[LOGIN] Cookie settings - SameSite: ${sameSite}, Secure: ${secure}, Production: ${isProduction}`)
+    
     setSecureCookies(
       c,
       authData.session.access_token,
@@ -380,6 +388,10 @@ auth.post('/login', async (c) => {
       authData.session.expires_at || 0,
       userData.id
     )
+    
+    // Log cookie headers being set
+    const cookieHeaders = c.res.headers.get('Set-Cookie')
+    console.log(`[LOGIN] Set-Cookie headers: ${cookieHeaders ? cookieHeaders.substring(0, 200) : 'NONE'}`)
 
 
     // Record login log (non-blocking - don't fail login if this fails)
