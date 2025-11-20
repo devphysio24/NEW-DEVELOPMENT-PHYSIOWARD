@@ -25,15 +25,21 @@ app.use('*', rateLimiter)
 const productionOrigins = process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()).filter(Boolean) || []
 const developmentOrigins = ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000']
 
+// Explicitly allow Vercel frontend URLs
+const vercelFrontendUrls = [
+  'https://new-development-physioward-green.vercel.app',
+  // Add other Vercel URLs here if needed
+]
+
 // Vercel preview URLs pattern - allow all Vercel preview and production URLs
 // Match both *.vercel.app and vercel.app domains
 const vercelPattern = /^https:\/\/(.*\.)?vercel\.app$/
 
-// In production, use configured origins + localhost + Vercel URLs
-// In development, use localhost origins
+// In production, use configured origins + localhost + Vercel URLs + explicit Vercel frontend URLs
+// In development, use localhost origins + explicit Vercel frontend URLs (for testing)
 const allowedOrigins = process.env.NODE_ENV === 'production'
-  ? [...productionOrigins, ...developmentOrigins]
-  : developmentOrigins
+  ? [...productionOrigins, ...developmentOrigins, ...vercelFrontendUrls]
+  : [...developmentOrigins, ...vercelFrontendUrls]
 
 app.use('/*', cors({
   origin: (origin) => {
