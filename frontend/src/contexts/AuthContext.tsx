@@ -1,9 +1,18 @@
-import { createContext, useContext, useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  useMemo,
+} from 'react'
 import type { ReactNode } from 'react'
 import { supabase } from '../lib/supabase'
-import { API_BASE_URL } from '../config/api'
-import { PUBLIC_ROUTES } from '../config/routes'
-import { useNavigate } from 'react-router-dom'
+import { PUBLIC_ROUTES, isPublicRoute, getDashboardRoute } from '../config/routes'
+import { useNavigate, useLocation } from 'react-router-dom'
+import { authService } from '../services/authService'
+import { apiClient, isApiError } from '../lib/apiClient'
 
 type Session = Awaited<ReturnType<typeof supabase.auth.getSession>>['data']['session']
 type User = NonNullable<Session>['user']
@@ -12,284 +21,331 @@ interface AuthContextType {
   user: User | null
   session: Session | null
   loading: boolean
-  signOut: () => Promise<void>
   role: string | null
-  setRole: (role: string | null) => void
-  refreshAuth: () => Promise<void>
   first_name: string | null
   last_name: string | null
   full_name: string | null
   phone: string | null
   business_name: string | null
   business_registration_number: string | null
+  signOut: () => Promise<void>
+  setRole: (role: string | null) => void
+  refreshAuth: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
 /* @refresh reset */
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null)
-  const [session, setSession] = useState<Session | null>(null)
+  const [state, setState] = useState({
+    user: null as User | null,
+    session: null as Session | null,
+    role: null as string | null,
+    first_name: null as string | null,
+    last_name: null as string | null,
+    full_name: null as string | null,
+    phone: null as string | null,
+    business_name: null as string | null,
+    business_registration_number: null as string | null,
+  })
   const [loading, setLoading] = useState(true)
-  const [role, setRole] = useState<string | null>(null)
-  const [first_name, setFirstName] = useState<string | null>(null)
-  const [last_name, setLastName] = useState<string | null>(null)
-  const [full_name, setFullName] = useState<string | null>(null)
-  const [phone, setPhone] = useState<string | null>(null)
-  const [business_name, setBusinessName] = useState<string | null>(null)
-  const [business_registration_number, setBusinessRegistrationNumber] = useState<string | null>(null)
+
   const navigate = useNavigate()
-  const userRef = useRef<User | null>(null) // Track user state without causing re-renders
+  const location = useLocation()
+  const userRef = useRef<User | null>(null)
+  const isLoggedOutRef = useRef(false) // Track logout state to prevent requests
+  const abortControllerRef = useRef<AbortController | null>(null) // Cancel pending requests on logout
 
-  // Update ref when user changes
-  useEffect(() => {
-    userRef.current = user
-  }, [user])
-
-  const fetchUserAndRole = useCallback(async (isInitialLoad = false) => {
+  // 🧩 Utility: safe API call with graceful error handling
+  const safeApiCall = useCallback(async () => {
+    // Don't make requests if user is logged out
+    if (isLoggedOutRef.current) {
+      return { data: null, error: 401 }
+    }
+    
+    // Create new AbortController for this request
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+    
     try {
-      // Use backend API to get user info (includes role) - cookies only, no localStorage
-      // The /me endpoint now automatically handles token refresh if needed
-      const response = await fetch(`${API_BASE_URL}/api/auth/me`, {
-        method: 'GET',
-        credentials: 'include', // Important: sends cookies
-        headers: {
-          'Content-Type': 'application/json',
-          'Cache-Control': 'no-cache', // Force fresh data
-        },
-      })
-
-      if (response.ok) {
-        const data = await response.json()
-        if (data.user) {
-          // Create a minimal user object for compatibility
-          const userObj: User = {
-            id: data.user.id,
-            email: data.user.email || '',
-            created_at: new Date().toISOString(),
-            app_metadata: {},
-            user_metadata: {},
-            aud: 'authenticated',
-            confirmation_sent_at: undefined,
-            recovery_sent_at: undefined,
-            email_change_sent_at: undefined,
-            new_email: undefined,
-            invited_at: undefined,
-            action_link: undefined,
-            email_confirmed_at: new Date().toISOString(),
-            phone: undefined,
-            confirmed_at: new Date().toISOString(),
-            last_sign_in_at: new Date().toISOString(),
-            role: 'authenticated',
-            updated_at: new Date().toISOString(),
-          }
-          
-          // CRITICAL: Detect if user changed (different user logged in)
-          // This should NOT happen if using different browsers (cookies are isolated)
-          // This WILL happen if using same browser different tabs (cookies are shared)
-          if (userRef.current && userRef.current.id !== userObj.id) {
-            console.error(`[AuthContext] 🚨 SECURITY: User changed from ${userRef.current.id} (${userRef.current.email}) to ${userObj.id} (${userObj.email})`)
-            console.error(`[AuthContext] Old role was stored in state, new role: ${data.user.role}`)
-            console.error(`[AuthContext] If you're using DIFFERENT browsers, this is a BUG! Cookies should be isolated.`)
-            console.error(`[AuthContext] If you're using SAME browser different tabs, this is EXPECTED (cookies are shared).`)
-            // Different user logged in - update the state to reflect the new user
-            // This is normal if they logged in on another tab in same browser
-          }
-          
-          setUser(userObj)
-          // Don't default to 'worker' - if role is missing, set to null and let the system handle it
-          setRole(data.user.role || null)
-          setFirstName(data.user.first_name || null)
-          setLastName(data.user.last_name || null)
-          setFullName(data.user.full_name || null)
-          setPhone(data.user.phone || null)
-          setBusinessName(data.user.business_name || null)
-          setBusinessRegistrationNumber(data.user.business_registration_number || null)
-          console.log(`[AuthContext] User session updated: ${userObj.id} (${userObj.email}), role: ${data.user.role || 'null'}, name: ${data.user.first_name || ''} ${data.user.last_name || ''}, business: ${data.user.business_name || 'none'}, isInitialLoad: ${isInitialLoad}`)
-          
-          // Create a minimal session object for compatibility
-          setSession({
-            access_token: '', // Not needed - we use cookies
-            refresh_token: '', // Not needed - we use cookies
-            expires_in: 3600,
-            expires_at: Math.floor(Date.now() / 1000) + 3600,
-            token_type: 'bearer',
-            user: userObj,
-          })
-          return // Success - exit early
-        } else {
-          // No user in response - only clear state if we had a user AND it's initial load
-          // Don't clear during polling to prevent false logouts
-            if (userRef.current && isInitialLoad) {
-              console.log('No user in response during initial load - clearing state')
-              setUser(null)
-              setRole(null)
-              setFirstName(null)
-              setLastName(null)
-              setFullName(null)
-              setPhone(null)
-              setBusinessName(null)
-              setBusinessRegistrationNumber(null)
-              setSession(null)
-            }
-          // During polling, just keep existing state
+      const result = await apiClient.get(
+        '/api/auth/me',
+        {
+          signal: controller.signal,
+          headers: { 'Cache-Control': 'no-cache' },
         }
-      } else if (response.status === 401) {
-        // Unauthorized - The /me endpoint already tried to refresh the token
-        // Only clear state on initial load, not during polling
-        // This prevents clearing state when another user logs in on different browser
-          if (userRef.current && isInitialLoad) {
-            console.log(`[AuthContext] Session invalidated during initial load - clearing user state. Current user: ${userRef.current.id} (${userRef.current.email})`)
-            setRole(null)
-            setUser(null)
-            setFirstName(null)
-            setLastName(null)
-            setFullName(null)
-            setPhone(null)
-            setBusinessName(null)
-            setSession(null)
-        } else if (userRef.current && !isInitialLoad) {
-          // During polling, log but don't clear - might be temporary
-          console.warn(`[AuthContext] Got 401 during polling for user: ${userRef.current.id} (${userRef.current.email}), but keeping state - will retry next poll`)
+      )
+      
+      // Clear controller after request completes
+      abortControllerRef.current = null
+      
+      if (isApiError(result)) {
+        // Silently handle 401 errors (user is logged out)
+        if (result.error.status === 401) {
+          return { error: 401, data: null }
         }
-      } else if (response.status === 404) {
-        // 404 errors should not happen for /me endpoint, but handle gracefully
-        console.warn('Unexpected 404 from /api/auth/me')
-        // Don't clear state for 404 - might be temporary server issue
-      } else {
-        // Unknown error - don't clear state if it's a server error
-        // Only clear if we get a specific forbidden error AND it's initial load
-          if (response.status === 403 && isInitialLoad) {
-            console.log('Access forbidden during initial load - clearing user state')
-            setRole(null)
-            setUser(null)
-            setFirstName(null)
-            setLastName(null)
-            setFullName(null)
-            setPhone(null)
-            setBusinessName(null)
-            setSession(null)
-          }
-        // For other errors (500, network, etc.), keep existing state
-        // This prevents false logouts due to temporary server issues
+        return { error: result.error.status || 'network', data: null }
       }
-    } catch (error: any) {
-      // Network errors or fetch failures - don't clear state
-      // This prevents false logouts due to network issues
-      // Only log the error, keep existing user state
-      if (error?.message?.includes('Failed to fetch')) {
-        // Network error - keep existing state
-        console.warn('Network error checking auth status, keeping existing state:', error.message)
-      } else {
-        console.error('Error fetching user and role:', error)
+      
+      return { data: result.data, error: null }
+    } catch (err: any) {
+      // Clear controller on error
+      abortControllerRef.current = null
+      
+      // Don't log AbortError (request was cancelled intentionally)
+      if (err.name === 'AbortError') {
+        return { data: null, error: 'aborted' }
       }
+      
+      // Only log network errors if user is not logged out
+      if (!isLoggedOutRef.current) {
+        console.warn('[Auth] Network error:', (err as Error).message)
+      }
+      return { data: null, error: 'network' }
     }
   }, [])
 
-  useEffect(() => {
-    let isMounted = true
-    let refreshInterval: ReturnType<typeof setInterval> | null = null
-
-    // Initial load - check backend cookie only (no localStorage)
-    // Pass isInitialLoad=true to allow clearing state if needed
-    // ALWAYS fetch fresh user data on mount to ensure correct user
-    console.log('[AuthContext] Initial mount - fetching user from backend...')
-    fetchUserAndRole(true).then(() => {
-      if (isMounted) {
-        setLoading(false)
-        console.log('[AuthContext] Initial user fetch complete')
+  // ⚡ Core: Fetch user + role from backend
+  const fetchUserAndRole = useCallback(
+    async ({
+      isInitialLoad = false,
+      force = false,
+    }: { isInitialLoad?: boolean; force?: boolean } = {}) => {
+      // Don't fetch if user is logged out
+      if (isLoggedOutRef.current) {
+        return
       }
+
+      const path = location.pathname
+      const isPublic = isPublicRoute(path)
+
+      // SECURITY: Always check authentication on initial load, even on public routes
+      // This ensures we detect if user is already logged in (has cookies) and redirect them
+      // Only skip check if it's not initial load, not forced, and we're on a public route with no user
+      if (isPublic && !userRef.current && !force && !isInitialLoad) {
+        if (import.meta.env.DEV)
+          console.log(`[Auth] Skipping check on public route: ${path}`)
+        return
+      }
+
+      const { data, error } = await safeApiCall()
+
+      // Silently handle 401 errors (user is logged out or session expired)
+      if (error === 401 || !data?.user) {
+        // Only update state if not already logged out
+        if (!isLoggedOutRef.current) {
+          if (isInitialLoad) {
+            setState((s) => ({
+              ...s,
+              user: null,
+              session: null,
+              role: null,
+              first_name: null,
+              last_name: null,
+              full_name: null,
+              phone: null,
+              business_name: null,
+              business_registration_number: null,
+            }))
+          }
+        }
+        return
+      }
+
+      // ✅ Construct new user/session objects
+      const userObj: User = {
+        id: data.user.id,
+        email: data.user.email || '',
+        created_at: new Date().toISOString(),
+        app_metadata: {},
+        user_metadata: {},
+        aud: 'authenticated',
+        confirmed_at: new Date().toISOString(),
+        last_sign_in_at: new Date().toISOString(),
+        role: 'authenticated',
+        updated_at: new Date().toISOString(),
+      }
+
+      const newSession: Session = {
+        access_token: '',
+        refresh_token: '',
+        expires_in: 3600,
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        token_type: 'bearer',
+        user: userObj,
+      }
+
+      userRef.current = userObj
+      // Reset logout flag when user successfully authenticates
+      isLoggedOutRef.current = false
+
+      const userRole = data.user.role || null
+
+      setState({
+        user: userObj,
+        session: newSession,
+        role: userRole,
+        first_name: data.user.first_name || null,
+        last_name: data.user.last_name || null,
+        full_name: data.user.full_name || null,
+        phone: data.user.phone || null,
+        business_name: data.user.business_name || null,
+        business_registration_number:
+          data.user.business_registration_number || null,
+      })
+
+      // SECURITY: Redirect authenticated users away from public routes (login/register)
+      // Only redirect on initial load to prevent redirect loops
+      if (isInitialLoad && isPublic && userRole) {
+        const dashboardRoute = getDashboardRoute(userRole as any)
+        if (dashboardRoute && dashboardRoute !== path) {
+          if (import.meta.env.DEV) {
+            console.log(`[Auth] Redirecting authenticated user from ${path} to ${dashboardRoute}`)
+          }
+          // Use replace to prevent back button from going to login
+          navigate(dashboardRoute, { replace: true })
+        }
+      }
+    },
+    [location.pathname, safeApiCall, navigate]
+  )
+
+  // 🕒 Initial + Polling Logic
+  useEffect(() => {
+    let mounted = true
+    let interval: ReturnType<typeof setInterval>
+
+    fetchUserAndRole({ isInitialLoad: true }).finally(() => {
+      if (mounted) setLoading(false)
     })
 
-    // Poll backend cookie every 60 seconds to check session validity
-    // This ensures user data stays fresh without excessive polling
-    refreshInterval = setInterval(() => {
-      if (isMounted) {
-        console.log('[AuthContext] Polling user session...')
-        fetchUserAndRole(false)
+    const poll = () => {
+      // Don't poll if user is logged out
+      if (isLoggedOutRef.current) {
+        return
       }
-    }, 60000) // Check every 60 seconds
+      const path = location.pathname
+      if (userRef.current || !isPublicRoute(path)) {
+        fetchUserAndRole()
+      }
+    }
+
+    interval = setInterval(poll, 60000)
+
+    // Only refresh on visibility change if user is on a public route or not authenticated
+    // This prevents unnecessary refreshes when switching tabs on dashboard pages
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        // Only poll if user is not authenticated or on a public route
+        // This prevents dashboard from refreshing when switching tabs
+        const path = location.pathname
+        if (!userRef.current || isPublicRoute(path)) {
+          poll()
+        }
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
 
     return () => {
-      isMounted = false
-      if (refreshInterval) {
-        clearInterval(refreshInterval)
-      }
+      mounted = false
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', handleVisibility)
     }
-  }, [fetchUserAndRole])
+  }, [fetchUserAndRole, location.pathname])
 
-  const signOut = async () => {
+  // 🚪 Logout handler
+  const signOut = useCallback(async () => {
+    // Mark as logged out immediately to prevent any further requests
+    isLoggedOutRef.current = true
+    userRef.current = null
+    
+    // Cancel any pending fetch requests
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+    
+    // Clear state immediately to prevent any UI flashing
+    setState({
+      user: null,
+      session: null,
+      role: null,
+      first_name: null,
+      last_name: null,
+      full_name: null,
+      phone: null,
+      business_name: null,
+      business_registration_number: null,
+    })
+    
     try {
-      // Ensure any localStorage/sessionStorage is cleared (safety measure)
-      // Even though we don't use it, some libraries might write to it
+      // Clear browser storage
+      localStorage.clear()
+      sessionStorage.clear()
+      
+      // Call logout endpoint to clear server-side cookies
       try {
-        localStorage.clear()
-        sessionStorage.clear()
-      } catch (e) {
-        // Ignore errors (might not be available in all contexts)
+        await authService.logout()
+      } catch (err) {
+        // Silently handle logout request errors
+        console.warn('[Auth] Logout request failed:', err)
       }
-
-      // Call backend logout to clear cookies (cookies only, no localStorage)
-      await fetch(`${API_BASE_URL}/api/auth/logout`, {
-        method: 'POST',
-        credentials: 'include', // Important: sends cookies
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
-    } catch (error) {
-      console.error('Logout error:', error)
+    } catch (err) {
+      // Silently handle logout errors
+      console.warn('[Auth] Logout error:', err)
     } finally {
-      // Clear local state only (cookies cleared by backend)
-      setUser(null)
-      setSession(null)
-      setRole(null)
-      setFirstName(null)
-      setLastName(null)
-      setFullName(null)
-      setPhone(null)
-      navigate(PUBLIC_ROUTES.LOGIN)
+      // Force full page reload to /login to ensure clean state
+      // This clears any cached data and ensures fresh login
+      window.location.href = PUBLIC_ROUTES.LOGIN
     }
-  }
+  }, [])
 
-  // Wrapper for refreshAuth to always use initial load behavior
   const refreshAuth = useCallback(async () => {
-    await fetchUserAndRole(true)
+    // Retry logic for mobile - cookies might need time to be processed
+    let retries = 3
+    let lastError = null
+    
+    while (retries > 0) {
+      try {
+        await fetchUserAndRole({ force: true })
+        // If successful, check if we got user data
+        if (userRef.current) {
+          return // Success - user is loaded
+        }
+        // If no user but no error, wait and retry
+        await new Promise(resolve => setTimeout(resolve, 500))
+        retries--
+      } catch (error) {
+        lastError = error
+        await new Promise(resolve => setTimeout(resolve, 500))
+        retries--
+      }
+    }
+    
+    // If all retries failed, log but don't throw (let ProtectedRoute handle it)
+    if (lastError) {
+      console.warn('[refreshAuth] Failed after retries:', lastError)
+    }
   }, [fetchUserAndRole])
 
-  // Memoize the context value to prevent unnecessary re-renders
-  const contextValue = useMemo(
+  // 🧠 Stable context value
+  const contextValue = useMemo<AuthContextType>(
     () => ({
-      user,
-      session,
+      ...state,
       loading,
       signOut,
-      role,
-      setRole,
+      setRole: (role) => setState((s) => ({ ...s, role })),
       refreshAuth,
-      first_name,
-      last_name,
-      full_name,
-      phone,
-      business_name,
-      business_registration_number,
     }),
-    [user, session, loading, signOut, role, setRole, refreshAuth, first_name, last_name, full_name, phone, business_name, business_registration_number]
+    [state, loading, signOut, refreshAuth]
   )
 
-  return (
-    <AuthContext.Provider value={contextValue}>
-      {children}
-    </AuthContext.Provider>
-  )
+  return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>
 }
 
 /* @refresh reset */
 export function useAuth() {
-  const context = useContext(AuthContext)
-  if (context === undefined) {
-    throw new Error('useAuth must be used within an AuthProvider')
-  }
-  return context
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth must be used within an AuthProvider')
+  return ctx
 }
-

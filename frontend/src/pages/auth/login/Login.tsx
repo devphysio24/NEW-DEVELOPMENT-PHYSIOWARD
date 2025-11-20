@@ -68,38 +68,20 @@ export function Login() {
       // Show success toast before redirecting
       showToastMessage('Login successful! Redirecting...', 'success')
       
-      // Set role immediately
+      // Set role from login response
       setRole(result.data.user.role)
       
-      // Try to refresh auth, but don't fail if it doesn't work
-      try {
-        await refreshAuth()
-      } catch (err) {
-        console.warn('Refresh auth failed, but continuing with login:', err)
-      }
+      // Wait longer for cookies to be set (especially important for mobile)
+      // Mobile browsers need more time to process cross-domain cookies
+      await new Promise(resolve => setTimeout(resolve, 1000))
       
-      // Get dashboard route
-      const dashboardRoute = getDashboardRoute(result.data.user.role as any)
-      if (!dashboardRoute) {
-        console.error('Invalid role for dashboard route:', result.data.user.role)
-        showToastMessage('Invalid user role. Please contact administrator.', 'error')
-        setLoading(false)
-        return
-      }
+      // Refresh auth to ensure user state is fully loaded
+      await refreshAuth()
       
-      // Detect mobile device
-      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+      // Additional wait to ensure auth state is updated
+      await new Promise(resolve => setTimeout(resolve, 300))
       
-      // Small delay to ensure cookies are set
-      await new Promise(resolve => setTimeout(resolve, 500))
-      
-      // On mobile, use window.location for more reliable navigation
-      // This ensures cookies are properly sent and page fully reloads
-      if (isMobile) {
-        window.location.href = dashboardRoute
-      } else {
-        navigate(dashboardRoute, { replace: true })
-      }
+      navigate(getDashboardRoute(result.data.user.role as any), { replace: true })
     } catch (err: any) {
       console.error('Login error:', err)
       showToastMessage('Failed to sign in. Please try again.', 'error')
@@ -141,38 +123,20 @@ export function Login() {
       // Show success toast before redirecting
       showToastMessage('Login successful! Redirecting...', 'success')
       
-      // Set role immediately
+      // Set role from login response
       setRole(result.data.user.role)
       
-      // Try to refresh auth, but don't fail if it doesn't work
-      try {
-        await refreshAuth()
-      } catch (err) {
-        console.warn('Refresh auth failed, but continuing with login:', err)
-      }
+      // Wait longer for cookies to be set (especially important for mobile)
+      // Mobile browsers need more time to process cross-domain cookies
+      await new Promise(resolve => setTimeout(resolve, 1000))
       
-      // Get dashboard route
-      const dashboardRoute = getDashboardRoute(result.data.user.role as any)
-      if (!dashboardRoute) {
-        console.error('Invalid role for dashboard route:', result.data.user.role)
-        showToastMessage('Invalid user role. Please contact administrator.', 'error')
-        setLoading(false)
-        return
-      }
+      // Refresh auth to ensure user state is fully loaded
+      await refreshAuth()
       
-      // Detect mobile device
-      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+      // Additional wait to ensure auth state is updated
+      await new Promise(resolve => setTimeout(resolve, 300))
       
-      // Small delay to ensure cookies are set
-      await new Promise(resolve => setTimeout(resolve, 500))
-      
-      // On mobile, use window.location for more reliable navigation
-      // This ensures cookies are properly sent and page fully reloads
-      if (isMobile) {
-        window.location.href = dashboardRoute
-      } else {
-        navigate(dashboardRoute, { replace: true })
-      }
+      navigate(getDashboardRoute(result.data.user.role as any), { replace: true })
     } catch (err: any) {
       console.error('Quick login error:', err)
       showToastMessage('Failed to sign in. Please try again.', 'error')
