@@ -65,20 +65,25 @@ export async function authMiddleware(c: Context<{ Variables: AuthVariables }>, n
     
     try {
       const supabaseUrl = process.env.SUPABASE_URL || ''
-      const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || ''
+      // Use anon key if available, fallback to service role key (both work for token validation)
+      const supabaseKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ''
       
-      if (!supabaseUrl || !supabaseAnonKey) {
-        console.error('[AUTH] Missing Supabase URL or Anon Key for token validation')
+      if (!supabaseUrl || !supabaseKey) {
+        console.error('[AUTH] Missing Supabase URL or Key for token validation')
+        console.error('[AUTH] SUPABASE_URL:', supabaseUrl ? 'SET' : 'MISSING')
+        console.error('[AUTH] SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? 'SET' : 'MISSING')
+        console.error('[AUTH] SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SET' : 'MISSING')
         return c.json({ error: 'Server configuration error' }, 500)
       }
       
       // Call Supabase Auth API directly to validate token
       // This is more reliable than using the client's getUser() method
+      // Note: Both anon key and service role key work for token validation
       const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${token}`,
-          'apikey': supabaseAnonKey,
+          'apikey': supabaseKey,
           'Content-Type': 'application/json',
         },
       })
