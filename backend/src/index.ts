@@ -31,15 +31,21 @@ const vercelFrontendUrls = [
   // Add other Vercel URLs here if needed
 ]
 
+// Custom production frontend domains
+const customFrontendUrls = [
+  'https://www.giodelapiedra.dev',
+  'https://giodelapiedra.dev', // Allow both www and non-www
+]
+
 // Vercel preview URLs pattern - allow all Vercel preview and production URLs
 // Match both *.vercel.app and vercel.app domains
 const vercelPattern = /^https:\/\/(.*\.)?vercel\.app$/
 
-// In production, use configured origins + localhost + Vercel URLs + explicit Vercel frontend URLs
-// In development, use localhost origins + explicit Vercel frontend URLs (for testing)
+// In production, use configured origins + localhost + Vercel URLs + explicit Vercel frontend URLs + custom domains
+// In development, use localhost origins + explicit Vercel frontend URLs + custom domains (for testing)
 const allowedOrigins = process.env.NODE_ENV === 'production'
-  ? [...productionOrigins, ...developmentOrigins, ...vercelFrontendUrls]
-  : [...developmentOrigins, ...vercelFrontendUrls]
+  ? [...productionOrigins, ...developmentOrigins, ...vercelFrontendUrls, ...customFrontendUrls]
+  : [...developmentOrigins, ...vercelFrontendUrls, ...customFrontendUrls]
 
 app.use('/*', cors({
   origin: (origin) => {
