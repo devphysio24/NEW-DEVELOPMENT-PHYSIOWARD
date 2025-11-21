@@ -31,6 +31,7 @@ interface AuthContextType {
   signOut: () => Promise<void>
   setRole: (role: string | null) => void
   refreshAuth: () => Promise<void>
+  setUserFromLogin: (userData: { id: string; email: string; role: string; first_name?: string; last_name?: string; full_name?: string }) => void
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
@@ -134,6 +135,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (error === 401 || !data?.user) {
         // Only update state if not already logged out
         if (!isLoggedOutRef.current) {
+          // IMPORTANT: On initial load, check if token exists in localStorage
+          // If token exists, don't clear user state immediately - might be a timing issue
+          if (isInitialLoad) {
+            const hasToken = localStorage.getItem('auth_token')
+            if (hasToken && hasToken.trim().length > 0) {
+              // Token exists but API call failed - likely timing issue or token needs refresh
+              // Don't clear user state immediately, let retry logic handle it
+              console.warn('[Auth] Initial load failed but token exists in localStorage - will retry')
+              // Don't return - let the code continue to handle retry
+              // But don't clear state yet
+              if (userRef.current) {
+                // User exists in ref - keep it
+                return
+              }
+              // No user in ref but token exists - might be expired, but don't clear immediately
+              // The ProtectedRoute will show loading while we retry
+              return
+            }
+          }
+          
+          // IMPORTANT: Don't clear user state on initial load if user already exists
+          // This prevents clearing user state right after login (mobile cookie timing issue)
+          // If user exists in state, keep it and let subsequent requests verify
+          if (isInitialLoad && userRef.current) {
+            // User exists but API call failed - likely cookie timing issue on mobile
+            // Don't clear user state, just log warning
+            if (import.meta.env.DEV) {
+              console.warn('[Auth] Initial load failed but user exists - likely cookie timing issue, keeping user state')
+            }
+            return
+          }
+          
           if (isInitialLoad) {
             setState((s) => ({
               ...s,
@@ -215,7 +248,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     let mounted = true
     let interval: ReturnType<typeof setInterval>
 
-    fetchUserAndRole({ isInitialLoad: true }).finally(() => {
+    // On initial load, check if token exists in localStorage
+    // If token exists, retry a few times before giving up
+    const initialLoad = async () => {
+      const hasToken = localStorage.getItem('auth_token')
+      if (hasToken && hasToken.trim().length > 0) {
+        // Token exists - retry up to 3 times with delays
+        let retries = 3
+        while (retries > 0 && mounted) {
+          try {
+            await fetchUserAndRole({ isInitialLoad: true, force: true })
+            // If we got user data, break
+            if (userRef.current) {
+              break
+            }
+            // Wait before retry (increasing delay)
+            await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)))
+            retries--
+          } catch (err) {
+            console.warn('[Auth] Initial load retry failed:', err)
+            await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries)))
+            retries--
+          }
+        }
+      } else {
+        // No token - just do normal fetch
+        await fetchUserAndRole({ isInitialLoad: true })
+      }
+    }
+
+    initialLoad().finally(() => {
       if (mounted) setLoading(false)
     })
 
@@ -328,6 +390,51 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [fetchUserAndRole])
 
+  // Set user state directly from login response (before cookies are fully processed)
+  const setUserFromLogin = useCallback((userData: { id: string; email: string; role: string; first_name?: string; last_name?: string; full_name?: string }) => {
+    const userObj: User = {
+      id: userData.id,
+      email: userData.email,
+      created_at: new Date().toISOString(),
+      app_metadata: {},
+      user_metadata: {},
+      aud: 'authenticated',
+      confirmed_at: new Date().toISOString(),
+      last_sign_in_at: new Date().toISOString(),
+      role: 'authenticated',
+      updated_at: new Date().toISOString(),
+    }
+
+    const newSession: Session = {
+      access_token: '',
+      refresh_token: '',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      token_type: 'bearer',
+      user: userObj,
+    }
+
+    userRef.current = userObj
+    isLoggedOutRef.current = false
+
+    const fullName = userData.full_name || 
+                     (userData.first_name && userData.last_name 
+                       ? `${userData.first_name} ${userData.last_name}` 
+                       : userData.email?.split('@')[0] || 'User')
+
+    setState({
+      user: userObj,
+      session: newSession,
+      role: userData.role,
+      first_name: userData.first_name || null,
+      last_name: userData.last_name || null,
+      full_name: fullName,
+      phone: null,
+      business_name: null,
+      business_registration_number: null,
+    })
+  }, [])
+
   // 🧠 Stable context value
   const contextValue = useMemo<AuthContextType>(
     () => ({
@@ -336,8 +443,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signOut,
       setRole: (role) => setState((s) => ({ ...s, role })),
       refreshAuth,
+      setUserFromLogin,
     }),
-    [state, loading, signOut, refreshAuth]
+    [state, loading, signOut, refreshAuth, setUserFromLogin]
   )
 
   return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>
