@@ -40,23 +40,9 @@ function getToken(c: Context): string | null {
 
 export async function authMiddleware(c: Context<{ Variables: AuthVariables }>, next: Next) {
   try {
-    // Debug: Log incoming cookies
-    const allCookies = c.req.header('Cookie')
-    const cookieToken = getCookie(c, COOKIE_NAMES.ACCESS_TOKEN)
-    const authHeader = c.req.header('Authorization')
-    const userAgent = c.req.header('user-agent') || 'unknown'
-    
-    console.log(`[AUTH] Request from: ${c.req.url}`)
-    console.log(`[AUTH] UserAgent: ${userAgent.substring(0, 50)}...`)
-    console.log(`[AUTH] Cookie header present: ${!!allCookies}`)
-    console.log(`[AUTH] Cookie token found: ${!!cookieToken}`)
-    console.log(`[AUTH] Auth header found: ${!!authHeader}`)
-    
     const token = getToken(c)
     
     if (!token) {
-      console.log(`[AUTH] No token found - returning 401`)
-      console.log(`[AUTH] All cookies: ${allCookies || 'NONE'}`)
       return c.json({ error: 'Unauthorized: No token provided' }, 401)
     }
 
