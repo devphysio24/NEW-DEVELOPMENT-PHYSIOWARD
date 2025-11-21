@@ -64,43 +64,17 @@ export async function authMiddleware(c: Context<{ Variables: AuthVariables }>, n
     let error = null
     
     try {
-      const supabaseUrl = process.env.SUPABASE_URL || ''
-      // Use anon key if available, fallback to service role key (both work for token validation)
-      const supabaseKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+      // Use Supabase client's getUser() method - this is the recommended way
+      // The service role client can validate user tokens using getUser()
+      const result = await supabase.auth.getUser(token)
+      user = result.data?.user || null
+      error = result.error || null
       
-      if (!supabaseUrl || !supabaseKey) {
-        console.error('[AUTH] Missing Supabase URL or Key for token validation')
-        console.error('[AUTH] SUPABASE_URL:', supabaseUrl ? 'SET' : 'MISSING')
-        console.error('[AUTH] SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? 'SET' : 'MISSING')
-        console.error('[AUTH] SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SET' : 'MISSING')
-        return c.json({ error: 'Server configuration error' }, 500)
-      }
-      
-      // Call Supabase Auth API directly to validate token
-      // This is more reliable than using the client's getUser() method
-      // Note: Both anon key and service role key work for token validation
-      const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'apikey': supabaseKey,
-          'Content-Type': 'application/json',
-        },
-      })
-      
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({})) as any
-        error = {
-          message: errorData?.message || errorData?.error_description || 'Token validation failed',
-          status: response.status,
-        }
-        console.log(`[AUTH] Token validation failed: ${error.message} (status: ${error.status})`)
-      } else {
-        const userData = await response.json() as any
-        user = userData || null
-        if (user) {
-          console.log(`[AUTH] Token validated successfully for user: ${user.email || user.id}`)
-        }
+      if (user) {
+        console.log(`[AUTH] Token validated successfully for user: ${user.email || user.id}`)
+      } else if (error) {
+        console.log(`[AUTH] Token validation error: ${error.message || 'Unknown error'}`)
+        console.log(`[AUTH] Error status: ${error.status || 'N/A'}`)
       }
     } catch (networkError: any) {
       // Handle network errors specifically
