@@ -2513,10 +2513,23 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
       return c.json({ error: 'Appointment not found or not authorized' }, 404)
     }
 
-    // Build update object
+    // Build update object - IMPORTANT: Update status first if provided, then date
+    // This ensures the constraint sees the correct status when validating the date
     const updateData: any = {
       updated_at: new Date().toISOString(),
     }
+
+    // Update status first if provided (needed for constraint validation)
+    if (updates.status) {
+      const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled', 'declined']
+      if (!validStatuses.includes(updates.status)) {
+        return c.json({ error: `status must be one of: ${validStatuses.join(', ')}` }, 400)
+      }
+      updateData.status = updates.status
+    }
+
+    // Get the status that will be used (new status or current status)
+    const effectiveStatus = updates.status || appointment.status
 
     if (updates.appointment_date) {
       const dateValidation = validateDateInput(updates.appointment_date)
@@ -2533,9 +2546,8 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
       // Check if appointment date is in the past
       const isPastDate = appointmentDateObj < today
       
-      // Get current or new status to determine if past dates are allowed
-      const newStatus = updates.status || appointment.status
-      const allowsPastDate = ['completed', 'cancelled', 'declined'].includes(newStatus)
+      // Determine if past dates are allowed based on effective status
+      const allowsPastDate = ['completed', 'cancelled', 'declined'].includes(effectiveStatus)
       
       // If date is in the past and status doesn't allow it, return error
       if (isPastDate && !allowsPastDate) {
@@ -2562,14 +2574,6 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
         return c.json({ error: 'duration_minutes must be between 15 and 480' }, 400)
       }
       updateData.duration_minutes = duration
-    }
-
-    if (updates.status) {
-      const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled', 'declined']
-      if (!validStatuses.includes(updates.status)) {
-        return c.json({ error: `status must be one of: ${validStatuses.join(', ')}` }, 400)
-      }
-      updateData.status = updates.status
     }
 
     if (updates.appointment_type) {
@@ -2601,6 +2605,32 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
 
     if (updateError) {
       console.error('[PATCH /clinician/appointments/:id] Error:', updateError)
+      
+      // Handle constraint violation specifically
+      if (updateError.code === '23514' && updateError.message?.includes('appointment_date_not_past')) {
+        // If updating to past date, ensure status allows it
+        const isUpdatingDate = updates.appointment_date !== undefined
+        const isUpdatingStatus = updates.status !== undefined
+        const effectiveStatus = updates.status || appointment.status
+        const allowsPastDate = ['completed', 'cancelled', 'declined'].includes(effectiveStatus)
+        
+        if (isUpdatingDate && !isUpdatingStatus && !allowsPastDate) {
+          return c.json({ 
+            error: 'Cannot set appointment date in the past for pending or confirmed appointments. Please update the status to completed, cancelled, or declined first.',
+            code: 'PAST_DATE_NOT_ALLOWED'
+          }, 400)
+        }
+        
+        // If status already allows past dates, the migration might not be run
+        if (allowsPastDate) {
+          return c.json({ 
+            error: 'Database constraint error. Please ensure the migration "migration_fix_appointment_date_constraint.sql" has been run.',
+            code: 'CONSTRAINT_ERROR',
+            details: 'The appointment date constraint may need to be updated to allow past dates for completed/cancelled/declined appointments.'
+          }, 500)
+        }
+      }
+      
       return c.json({ error: 'Failed to update appointment', details: updateError.message }, 500)
     }
 
