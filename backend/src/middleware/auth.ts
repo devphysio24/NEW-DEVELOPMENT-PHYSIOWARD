@@ -87,6 +87,15 @@ export async function authMiddleware(c: Context<{ Variables: AuthVariables }>, n
     }
 
     if (error || !user) {
+      // Log detailed error for debugging
+      if (error) {
+        console.log(`[AUTH] Token validation error: ${error.message || 'Unknown error'}`)
+        console.log(`[AUTH] Error status: ${error.status || 'N/A'}`)
+      }
+      if (!user) {
+        console.log(`[AUTH] Token validation failed: No user returned from Supabase`)
+      }
+      
       // Clear invalid cookies
       const isProduction = process.env.NODE_ENV === 'production'
       const userAgent = c.req.header('user-agent')
@@ -97,7 +106,7 @@ export async function authMiddleware(c: Context<{ Variables: AuthVariables }>, n
       setCookie(c, COOKIE_NAMES.REFRESH_TOKEN, '', { httpOnly: true, secure, sameSite, maxAge: 0, path: '/' })
       setCookie(c, COOKIE_NAMES.USER_ID, '', { httpOnly: true, secure, sameSite, maxAge: 0, path: '/' })
       
-      return c.json({ error: 'Unauthorized: Invalid token' }, 401)
+      return c.json({ error: 'Unauthorized: Invalid token', details: error?.message || 'Token validation failed' }, 401)
     }
 
     // Get user role from database - try with regular client first
