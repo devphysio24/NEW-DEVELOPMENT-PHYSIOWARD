@@ -258,7 +258,7 @@ admin.get('/stats', authMiddleware, requireRole(['admin']), async (c) => {
 // Create user account (admin only - can create any role)
 admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
   try {
-    const { email, password, role, first_name, last_name, business_name, business_registration_number } = await c.req.json()
+    const { email, password, role, first_name, last_name, business_name, business_registration_number, gender, date_of_birth } = await c.req.json()
 
     // Validate required fields
     if (!email || !password) {
@@ -276,6 +276,35 @@ admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
 
     if (!trimmedFirstName || !trimmedLastName) {
       return c.json({ error: 'First name and last name cannot be empty' }, 400)
+    }
+
+    // Validate gender
+    if (gender && gender !== 'male' && gender !== 'female') {
+      return c.json({ error: 'Gender must be either "male" or "female"' }, 400)
+    }
+
+    // Validate date of birth
+    if (date_of_birth) {
+      const birthDate = new Date(date_of_birth)
+      if (isNaN(birthDate.getTime())) {
+        return c.json({ error: 'Invalid date of birth format' }, 400)
+      }
+
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      if (birthDate >= today) {
+        return c.json({ error: 'Date of birth must be in the past' }, 400)
+      }
+      
+      // Validate minimum age (18 years old)
+      const { calculateAge } = await import('../utils/ageUtils.js')
+      const age = calculateAge(date_of_birth)
+      if (age === null) {
+        return c.json({ error: 'Invalid date of birth' }, 400)
+      }
+      if (age < 18) {
+        return c.json({ error: `Age must be at least 18 years old. Current age: ${age} years old` }, 400)
+      }
     }
 
     // Validate role
@@ -352,6 +381,14 @@ admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
       full_name: fullName,
       password_hash: hashedPassword,
       created_at: new Date().toISOString(),
+    }
+
+    // Add gender and date_of_birth if provided
+    if (gender) {
+      userInsertData.gender = gender
+    }
+    if (date_of_birth) {
+      userInsertData.date_of_birth = date_of_birth
     }
 
     // Add business fields for supervisors
@@ -1085,7 +1122,7 @@ admin.get('/clinicians/:id', authMiddleware, requireRole(['admin']), async (c) =
             site_location
           )
         `)
-        .in('exception_type', MEDICAL_INCIDENT_TYPES)
+        .in('exception_type', incidentTypes)
         .not('clinician_id', 'is', null)
         .eq('clinician_id', clinicianId)
         .order('created_at', { ascending: false }),

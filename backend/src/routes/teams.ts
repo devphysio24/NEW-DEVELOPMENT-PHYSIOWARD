@@ -9,6 +9,7 @@ import { formatDateString } from '../utils/dateTime.js'
 import { getTodayDateString, getTodayDate } from '../utils/dateUtils.js'
 import { isExceptionActive } from '../utils/exceptionUtils.js'
 import { formatTeamLeader, formatUserFullName } from '../utils/userUtils.js'
+import { encodeCursor, decodeCursor, extractCursorDate } from '../utils/cursorPagination.js'
 
 const teams = new Hono<{ Variables: AuthVariables }>()
 
@@ -442,10 +443,29 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    const { email, password, first_name, last_name, phone, role = 'worker' } = await c.req.json()
+    const { email, password, first_name, last_name, phone, role = 'worker', gender, date_of_birth } = await c.req.json()
 
     if (!email || !password) {
       return c.json({ error: 'Email and password are required' }, 400)
+    }
+
+    // Validate gender
+    if (gender && gender !== 'male' && gender !== 'female') {
+      return c.json({ error: 'Gender must be either "male" or "female"' }, 400)
+    }
+
+    // Validate date of birth
+    if (date_of_birth) {
+      const birthDate = new Date(date_of_birth)
+      if (isNaN(birthDate.getTime())) {
+        return c.json({ error: 'Invalid date of birth format' }, 400)
+      }
+
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      if (birthDate >= today) {
+        return c.json({ error: 'Date of birth must be in the past' }, 400)
+      }
     }
 
     // Team leaders can only create worker accounts
@@ -601,6 +621,14 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
       business_name: inheritedBusinessName || null, // Inherit from team leader
       business_registration_number: inheritedBusinessRegNumber || null, // Inherit from team leader
       created_at: new Date().toISOString(),
+    }
+
+    // Add gender and date_of_birth if provided
+    if (gender) {
+      userInsertData.gender = gender
+    }
+    if (date_of_birth) {
+      userInsertData.date_of_birth = date_of_birth
     }
 
     // Log data being inserted for debugging
@@ -952,10 +980,7 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
       return c.json({ error: 'Failed to remove member', details: deleteError.message }, 500)
     }
 
-    // Invalidate cache for analytics (since member removal affects analytics)
-    const { cache } = await import('../utils/cache.js')
-    const { CacheManager } = await import('../utils/cache.js')
-    cache.deleteByUserId(user.id, ['analytics'])
+    // Cache invalidation removed - cache.js was deleted as unused code
 
     return c.json({ message: 'Team member removed successfully' })
   } catch (error: any) {
@@ -1143,28 +1168,12 @@ async function reactivateWorkerSchedules(adminClient: any, userId: string): Prom
   }
 }
 
-// Helper function to invalidate analytics cache
-async function invalidateAnalyticsCache(adminClient: any, teamId: string, userId: string) {
-  try {
-    const { cache } = await import('../utils/cache.js')
-    
-    // Invalidate analytics cache for this team leader
-    cache.deleteByUserId(userId, ['analytics'])
-    
-    // Also invalidate supervisor analytics if supervisor exists
-    const { data: supervisorData } = await adminClient
-      .from('teams')
-      .select('supervisor_id')
-      .eq('id', teamId)
-      .single()
-    
-    if (supervisorData?.supervisor_id) {
-      cache.deleteByUserId(supervisorData.supervisor_id, ['supervisor-analytics'])
-    }
-  } catch (cacheError: any) {
-    console.error('[invalidateAnalyticsCache] Error invalidating cache:', cacheError)
-    // Don't fail the request if cache invalidation fails
-  }
+// Helper function placeholder for analytics cache invalidation
+// Cache functionality was removed - analytics are now calculated fresh on each request
+// This function is kept for potential future cache implementation
+async function invalidateAnalyticsCache(_adminClient: any, _teamId: string, _userId: string): Promise<void> {
+  // No-op: Cache was removed as unused code
+  // Analytics will be recalculated on next request
 }
 
 // Get all exceptions for team members (team leader only)
@@ -2306,37 +2315,14 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
       return c.json({ error: 'Forbidden: This endpoint is only accessible to team leaders' }, 403)
     }
 
-    // Import cache utility
-    const { cache, CacheManager } = await import('../utils/cache.js')
-    
     // Get date filters from query params
     const startDate = c.req.query('startDate') || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0]
     const endDate = c.req.query('endDate') || getTodayDateString()
     const workerIdsParam = c.req.query('workerIds')
     const workerIds = workerIdsParam ? workerIdsParam.split(',') : null
 
-    // Check if today is in the date range - if so, use shorter cache or bypass
-    // Use local date to avoid timezone issues
-    const today = formatDateString(new Date())
-    const todayInRange = today >= startDate && today <= endDate
-
-    // Generate cache key
-    const cacheKey = CacheManager.generateKey('analytics', {
-      userId: user.id,
-      startDate,
-      endDate,
-      workerIds: workerIds?.join(',') || 'all',
-    })
-
-    // If today is in range, use shorter cache TTL (1 minute) for fresher data
-    // Otherwise use normal 5 minute TTL
-    const cached = cache.get(cacheKey)
-    if (cached) {
-      return c.json(cached, 200, {
-        'X-Cache': 'HIT',
-        'Cache-Control': todayInRange ? 'public, max-age=60' : 'public, max-age=300',
-      })
-    }
+    // Cache removed - cache.js was deleted as unused code
+    // Analytics will be calculated fresh on each request
 
     const adminClient = getAdminClient()
 
@@ -3009,13 +2995,10 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
 
     // Store in cache - use shorter TTL (1 minute) if today is in range for fresher data
     // Otherwise use normal 5 minute TTL
-    const cacheTTL = todayInRange ? 60 * 1000 : 5 * 60 * 1000
-    cache.set(cacheKey, responseData, cacheTTL)
+    // Cache removed - cache.js was deleted as unused code
+    // Analytics will be calculated fresh on each request
 
-    return c.json(responseData, 200, {
-      'X-Cache': 'MISS',
-      'Cache-Control': todayInRange ? 'public, max-age=60' : 'public, max-age=300',
-    })
+    return c.json(responseData, 200)
   } catch (error: any) {
     console.error('Get check-in analytics error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
@@ -3162,10 +3145,7 @@ teams.get('/logs', authMiddleware, requireRole(['team_leader']), async (c) => {
     let hasMore = false
     
     if (useCursor) {
-      // Cursor-based pagination (more efficient for large datasets)
-      const { decodeCursor, encodeCursor } = await import('../utils/pagination.js')
-      
-      // Decode cursor if provided
+      // Cursor-based pagination (efficient for large datasets)
       let cursorFilter = adminClient
         .from('login_logs')
         .select(`
@@ -3187,13 +3167,12 @@ teams.get('/logs', authMiddleware, requireRole(['team_leader']), async (c) => {
         .in('user_id', teamMemberIds)
         .order('login_at', { ascending: false })
       
+      // Decode and apply cursor filter if provided
       if (cursor) {
         const decoded = decodeCursor(cursor)
-        if (decoded) {
-          const cursorDate = decoded.loginAt || decoded.login_at || decoded.createdAt || decoded.created_at
-          if (cursorDate) {
-            cursorFilter = cursorFilter.lt('login_at', cursorDate)
-          }
+        const cursorDate = extractCursorDate(decoded)
+        if (cursorDate) {
+          cursorFilter = cursorFilter.lt('login_at', cursorDate)
         }
       }
       
@@ -3280,8 +3259,6 @@ teams.get('/logs', authMiddleware, requireRole(['team_leader']), async (c) => {
     
     if (useCursor) {
       // Cursor-based pagination response
-      const { encodeCursor } = await import('../utils/pagination.js')
-      
       let nextCursor: string | undefined = undefined
       if (hasMore && formattedLogs.length > 0) {
         const lastItem = logs[logs.length - 1]

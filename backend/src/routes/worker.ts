@@ -3,6 +3,15 @@ import { authMiddleware, requireRole } from '../middleware/auth.js'
 import { getCaseStatusFromNotes } from '../utils/caseStatus.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { analyzeIncident } from '../utils/openai.js'
+import { getTodayDateString } from '../utils/dateUtils.js'
+import { formatDateString } from '../utils/dateTime.js'
+import { getExceptionDatesForScheduledDates } from '../utils/exceptionUtils.js'
+import { 
+  getScheduledDatesInRange, 
+  findNextScheduledDate, 
+  formatDateForDisplay 
+} from '../utils/scheduleUtils.js'
+import { calculateAge } from '../utils/ageUtils.js'
 
 const worker = new Hono()
 
@@ -479,7 +488,6 @@ worker.get('/cases', authMiddleware, requireRole(['worker']), async (c) => {
       .in('exception_type', ['injury', 'medical_leave', 'accident', 'other'])
 
     // Filter by status
-    const { getTodayDateString } = await import('../utils/dateUtils.js')
     const todayStr = getTodayDateString()
     if (status === 'active') {
       query = query.eq('is_active', true).gte('start_date', todayStr).or(`end_date.is.null,end_date.gte.${todayStr}`)
@@ -727,7 +735,7 @@ worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
     if (userIds.length > 0) {
       const { data: users } = await adminClient
         .from('users')
-        .select('id, email, first_name, last_name, full_name')
+        .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
         .in('id', userIds)
       
       users?.forEach((u: any) => userMap.set(u.id, u))
@@ -788,7 +796,7 @@ worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
     // Get worker's user data from database
     const { data: workerUser } = await adminClient
       .from('users')
-      .select('id, email, first_name, last_name, full_name')
+      .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
       .eq('id', user.id)
       .single()
 
@@ -799,6 +807,8 @@ worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
       workerName: formatUserName(workerUser),
       workerEmail: workerUser?.email || user.email || '',
       workerInitials: (workerUser?.first_name?.[0]?.toUpperCase() || '') + (workerUser?.last_name?.[0]?.toUpperCase() || '') || 'U',
+      workerGender: (workerUser as any)?.gender || null,
+      workerDateOfBirth: (workerUser as any)?.date_of_birth || null,
       teamId: caseData.team_id,
       teamName: team?.name || '',
       siteLocation: team?.site_location || '',
@@ -823,6 +833,238 @@ worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
     return c.json({ case: formattedCase }, 200)
   } catch (error: any) {
     console.error('[GET /worker/cases/:id] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get worker's check-in streak
+worker.get('/streak', authMiddleware, requireRole(['worker']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const todayStr = getTodayDateString()
+
+    // Get all active schedules for this worker
+    const { data: schedules, error: scheduleError } = await adminClient
+      .from('worker_schedules')
+      .select('*')
+      .eq('worker_id', user.id)
+      .eq('is_active', true)
+      .order('scheduled_date', { ascending: false })
+      .order('day_of_week', { ascending: true })
+
+    if (scheduleError) {
+      console.error('[GET /worker/streak] Error fetching schedules:', scheduleError)
+      return c.json({ error: 'Failed to fetch schedules', details: scheduleError.message }, 500)
+    }
+
+    // Get all check-ins for this worker (last 30 days for performance)
+    const thirtyDaysAgo = new Date(today)
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+    const thirtyDaysAgoStr = formatDateString(thirtyDaysAgo)
+
+    const { data: checkIns, error: checkInError } = await adminClient
+      .from('daily_checkins')
+      .select('check_in_date')
+      .eq('user_id', user.id)
+      .gte('check_in_date', thirtyDaysAgoStr)
+      .order('check_in_date', { ascending: false })
+
+    // Get all exceptions for this worker (to check if scheduled dates have exceptions)
+    const { data: exceptions, error: exceptionError } = await adminClient
+      .from('worker_exceptions')
+      .select('exception_type, start_date, end_date, is_active, deactivated_at, reason')
+      .eq('user_id', user.id)
+
+    if (exceptionError) {
+      console.error('[GET /worker/streak] Error fetching exceptions:', exceptionError)
+      // Continue without exceptions - not critical
+    }
+
+    if (checkInError) {
+      console.error('[GET /worker/streak] Error fetching check-ins:', checkInError)
+      return c.json({ error: 'Failed to fetch check-ins', details: checkInError.message }, 500)
+    }
+
+    // Create a set of dates with check-ins (normalize to YYYY-MM-DD format)
+    const checkInDates = new Set<string>()
+    if (checkIns) {
+      checkIns.forEach((checkIn: any) => {
+        const dateStr = typeof checkIn.check_in_date === 'string' 
+          ? checkIn.check_in_date.split('T')[0]
+          : formatDateString(new Date(checkIn.check_in_date))
+        checkInDates.add(dateStr)
+      })
+    }
+
+    // Get scheduled dates for past 30 days (for streak calculation)
+    const pastScheduledDates = getScheduledDatesInRange(schedules || [], thirtyDaysAgo, today)
+    
+    // Check which scheduled dates have exceptions (using centralized function)
+    const { exceptionDates, scheduledDatesWithExceptions } = getExceptionDatesForScheduledDates(
+      pastScheduledDates,
+      exceptions || []
+    )
+
+    // Calculate streak: count consecutive days (going backwards from today)
+    // where worker had a schedule AND completed check-in
+    // Rules:
+    // - Days with schedule AND check-in: count towards streak
+    // - Days with schedule but NO check-in: break streak
+    // - Days with NO schedule: skip (don't break streak, don't count)
+    // Current streak is the most recent consecutive days with schedule + check-in
+    
+    let currentStreak = 0
+    let longestStreak = 0
+    let tempStreak = 0
+    let foundFirstScheduledDay = false
+    let foundMostRecentCheckIn = false // Track if we've found the most recent check-in
+
+    // Go backwards from today to find consecutive days with schedule + check-in
+    for (let dayOffset = 0; dayOffset <= 30; dayOffset++) {
+      const checkDate = new Date(today)
+      checkDate.setDate(checkDate.getDate() - dayOffset)
+      const checkDateStr = formatDateString(checkDate)
+
+      const hadSchedule = pastScheduledDates.has(checkDateStr)
+      const hadCheckIn = checkInDates.has(checkDateStr)
+      const hadException = scheduledDatesWithExceptions.has(checkDateStr)
+
+      if (hadSchedule) {
+        // Worker had a schedule on this day
+        foundFirstScheduledDay = true
+        
+        // If there's an exception on this scheduled date, don't count it (don't break streak, don't count)
+        if (hadException) {
+          // Exception dates don't break streak - continue
+          continue
+        }
+        
+        if (hadCheckIn) {
+          // Had schedule AND check-in - count towards streak
+          if (!foundMostRecentCheckIn) {
+            // This is the most recent check-in, start building current streak from here
+            foundMostRecentCheckIn = true
+            tempStreak = 1
+            currentStreak = 1
+          } else {
+            // Continue building the current streak
+            tempStreak++
+            currentStreak = tempStreak
+          }
+          
+          // Always update longest streak
+          longestStreak = Math.max(longestStreak, tempStreak)
+        } else {
+          // Had schedule but NO check-in - break streak
+          if (foundMostRecentCheckIn) {
+            // We've already found the most recent check-in, so this breaks the current streak
+            // Don't update currentStreak anymore
+            tempStreak = 0
+          } else {
+            // Haven't found most recent check-in yet, continue searching
+            tempStreak = 0
+          }
+        }
+      } else {
+        // No schedule - skip this day (doesn't break streak, doesn't count)
+        // Only reset if we haven't found any scheduled days yet
+        if (!foundFirstScheduledDay && dayOffset === 0) {
+          // Today with no schedule - no streak
+          currentStreak = 0
+        }
+        // For previous days without schedule, just continue (don't break streak, don't count)
+        // If we're building a streak, continue building it
+        if (foundMostRecentCheckIn && tempStreak > 0) {
+          // We're in a streak, skipping non-scheduled days doesn't break it
+          // But we don't increment the streak either
+        }
+      }
+    }
+
+    // Check if today's check-in is completed
+    const todayCheckInCompleted = checkInDates.has(todayStr) && pastScheduledDates.has(todayStr)
+
+    // Count completed days (past days with schedule AND check-in, excluding exception dates)
+    const completedDays = Array.from(pastScheduledDates).filter(date => 
+      checkInDates.has(date) && !scheduledDatesWithExceptions.has(date)
+    ).length
+    
+    // Find missed schedule dates (past scheduled dates without check-in AND without exception)
+    // Exception dates should NOT be counted as missed schedules
+    const missedScheduleDates = Array.from(pastScheduledDates)
+      .filter(date => !checkInDates.has(date) && !scheduledDatesWithExceptions.has(date))
+      .sort()
+      .reverse() // Most recent first
+    
+    // Debug logging for streak calculation
+    console.log(`[GET /worker/streak] Current streak: ${currentStreak}, Completed days: ${completedDays}, Past scheduled days: ${pastScheduledDates.size}`)
+
+    // Get future scheduled dates (next 90 days)
+    const futureEndDate = new Date(today)
+    futureEndDate.setDate(futureEndDate.getDate() + 90)
+    const futureScheduledDates = getScheduledDatesInRange(schedules || [], today, futureEndDate)
+    
+    // Calculate total scheduled days (past + future)
+    const totalScheduledDaysIncludingFuture = pastScheduledDates.size + futureScheduledDates.size
+    const pastScheduledDays = pastScheduledDates.size
+
+    // Find next scheduled check-in date
+    let nextCheckInDate: string | null = null
+    let nextCheckInDateFormatted: string | null = null
+    
+    // First check if today has a schedule but no check-in yet
+    if (pastScheduledDates.has(todayStr) && !checkInDates.has(todayStr)) {
+      nextCheckInDate = todayStr
+      nextCheckInDateFormatted = 'Today'
+    } else {
+      // Find next future scheduled date
+      nextCheckInDate = findNextScheduledDate(schedules || [], today, 90)
+      if (nextCheckInDate) {
+        nextCheckInDateFormatted = formatDateForDisplay(nextCheckInDate)
+      }
+    }
+
+    // Calculate next milestone (7 days, 14 days, 30 days, etc.)
+    const milestones = [7, 14, 30, 60, 90]
+    const nextMilestone = milestones.find(m => m > currentStreak) || null
+    const daysUntilNextMilestone = nextMilestone ? nextMilestone - currentStreak : null
+
+    // Check if worker has achieved 7-day badge
+    const hasSevenDayBadge = currentStreak >= 7
+
+    return c.json({
+      currentStreak,
+      longestStreak,
+      todayCheckInCompleted,
+      nextMilestone,
+      daysUntilNextMilestone,
+      hasSevenDayBadge,
+      totalScheduledDays: totalScheduledDaysIncludingFuture,
+      pastScheduledDays,
+      completedDays,
+      missedScheduleDates,
+      missedScheduleCount: missedScheduleDates.length,
+      exceptionDates,
+      nextCheckInDate,
+      nextCheckInDateFormatted,
+      badge: hasSevenDayBadge ? {
+        name: '7-Day Streak',
+        description: 'Completed 7 consecutive days of check-ins',
+        icon: '🔥',
+        achieved: true,
+        achievedDate: todayStr, // Approximate - could track actual achievement date
+      } : null,
+    }, 200)
+
+  } catch (error: any) {
+    console.error('[GET /worker/streak] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
   }
 })

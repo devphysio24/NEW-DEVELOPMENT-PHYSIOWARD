@@ -9,19 +9,27 @@ import { getAdminClient } from '../utils/adminClient.js'
 import { ensureUserRecordExists } from '../utils/userUtils.js'
 import { generateUniqueQuickLoginCode, isValidQuickLoginCode, generateUniquePinCode } from '../utils/quickLoginCode.js'
 import { cascadeBusinessInfoUpdate } from '../utils/executiveHelpers.js'
-import { getCookieSameSite } from '../utils/cookieHelpers.js'
 
 /**
- * Set secure cookies for authentication
- * Production: SameSite=None + Secure=true (required for mobile cross-domain)
- * Development: SameSite=Lax (same-domain)
+ * Helper function to set secure cookies
+ * 
+ * SECURITY FEATURES:
+ * - httpOnly: true - Prevents JavaScript access (XSS protection)
+ * - secure: true in production - Only sent over HTTPS
+ * - sameSite: 'None' in production, 'Lax' in dev - CSRF protection
+ * - Proper expiration based on token lifetime
+ * - path: '/' - Available for entire application
+ * 
+ * For cross-origin requests (Vercel frontend → Render backend), use 'None'
+ * For same-origin or localhost, use 'Lax'
+ * 'None' requires 'Secure: true' (HTTPS only)
+ * 'Strict' doesn't work for cross-origin requests
  */
 function setSecureCookies(c: any, accessToken: string, refreshToken: string, expiresAt: number, userId: string) {
   const isProduction = process.env.NODE_ENV === 'production'
-  const userAgent = c.req.header('user-agent')
-  const sameSite = getCookieSameSite(userAgent)
-  // MUST be true when SameSite=None (required for mobile cross-domain cookies)
-  const secure = isProduction
+  
+  const sameSite = isProduction ? 'None' : 'Lax'
+  const secure = isProduction // Must be true when SameSite=None
   
   // expiresAt is in seconds since epoch (Unix timestamp)
   // Calculate maxAge properly
@@ -72,13 +80,22 @@ function setSecureCookies(c: any, accessToken: string, refreshToken: string, exp
 }
 
 /**
- * Clear authentication cookies
+ * Helper function to clear cookies securely
+ * 
+ * SECURITY FEATURES:
+ * - httpOnly: true - Prevents JavaScript access (XSS protection)
+ * - secure: true in production - Only sent over HTTPS
+ * - sameSite: 'None' in production, 'Lax' in dev - CSRF protection
+ * - maxAge: 0 - Immediately expires and deletes the cookie
+ * - path: '/' - Ensures cookie is cleared for entire application
+ * 
+ * This function is called on logout to ensure all authentication cookies
+ * are properly removed from the browser for security.
  */
 function clearCookies(c: any) {
   const isProduction = process.env.NODE_ENV === 'production'
-  const userAgent = c.req.header('user-agent')
-  const sameSite = getCookieSameSite(userAgent)
-  const secure = isProduction
+  const sameSite = isProduction ? 'None' : 'Lax' // Match setSecureCookies
+  const secure = isProduction // Must be true when SameSite=None
   
   // Clear access token cookie - set maxAge to 0 and empty value
   // Setting maxAge to 0 tells the browser to delete the cookie immediately
@@ -119,7 +136,7 @@ const auth = new Hono<{ Variables: AuthVariables }>()
 // This ensures proper hierarchy and access control
 auth.post('/register', async (c) => {
   try {
-    const { email, password, role, first_name, last_name, business_name, business_registration_number } = await c.req.json()
+    const { email, password, role, first_name, last_name, business_name, business_registration_number, gender, date_of_birth } = await c.req.json()
     
     // Validate required fields
     if (!email || !password) {
@@ -136,6 +153,38 @@ auth.post('/register', async (c) => {
 
     if (!trimmedFirstName || !trimmedLastName) {
       return c.json({ error: 'First name and last name cannot be empty' }, 400)
+    }
+
+    // Validate gender
+    if (!gender || (gender !== 'male' && gender !== 'female')) {
+      return c.json({ error: 'Gender is required and must be either "male" or "female"' }, 400)
+    }
+
+    // Validate date of birth
+    if (!date_of_birth) {
+      return c.json({ error: 'Date of birth is required' }, 400)
+    }
+
+    // Validate date format and ensure it's in the past
+    const birthDate = new Date(date_of_birth)
+    if (isNaN(birthDate.getTime())) {
+      return c.json({ error: 'Invalid date of birth format' }, 400)
+    }
+
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    if (birthDate >= today) {
+      return c.json({ error: 'Date of birth must be in the past' }, 400)
+    }
+    
+    // Validate minimum age (18 years old)
+    const { calculateAge } = await import('../utils/ageUtils.js')
+    const age = calculateAge(date_of_birth)
+    if (age === null) {
+      return c.json({ error: 'Invalid date of birth' }, 400)
+    }
+    if (age < 18) {
+      return c.json({ error: `Age must be at least 18 years old. Current age: ${age} years old` }, 400)
     }
     
     // Validate role
@@ -217,6 +266,8 @@ auth.post('/register', async (c) => {
       last_name: trimmedLastName,
       full_name: fullName, // Store for backward compatibility
       password_hash: hashedPassword, // Store hashed password (additional security layer)
+      gender: gender,
+      date_of_birth: date_of_birth,
       created_at: new Date().toISOString(),
     }
 
@@ -314,38 +365,10 @@ auth.post('/login', async (c) => {
 
 
     // Try Supabase Auth first (simplest approach)
-    // Wrap in try-catch to handle network errors gracefully
-    let authData = null
-    let authError = null
-    
-    try {
-      const result = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      })
-      authData = result.data
-      authError = result.error
-    } catch (networkError: any) {
-      // Handle network errors from Supabase
-      const isNetworkError = 
-        networkError.code === 'ECONNRESET' ||
-        networkError.code === 'ETIMEDOUT' ||
-        networkError.message?.includes('fetch failed') ||
-        networkError.message?.includes('network') ||
-        networkError.cause?.code === 'ECONNRESET'
-      
-      if (isNetworkError) {
-        console.error('[POST /login] Network error connecting to Supabase:', networkError.message || networkError.code)
-        return c.json({ 
-          error: 'Service temporarily unavailable', 
-          message: 'Unable to connect to authentication service. Please try again in a moment.',
-          retry: true
-        }, 503)
-      }
-      
-      // Re-throw if it's not a network error
-      throw networkError
-    }
+    let { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    })
 
     // If Supabase Auth fails, check if user has password_hash (might be out of sync)
     if (authError || !authData?.session) {
@@ -895,7 +918,7 @@ auth.get('/me', async (c) => {
     // Get user role from database - try with regular client first
     let { data: userData, error: dbError } = await supabase
       .from('users')
-      .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code')
+      .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code, gender, date_of_birth')
       .eq('id', user.id)
       .single()
 
@@ -906,7 +929,7 @@ auth.get('/me', async (c) => {
       const adminClient = getAdminClient()
       const { data: adminUserData, error: adminError } = await adminClient
         .from('users')
-        .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code')
+        .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code, gender, date_of_birth')
         .eq('id', user.id)
         .single()
 
@@ -930,7 +953,6 @@ auth.get('/me', async (c) => {
             ...autoCreatedUser,
             business_name: null,
             business_registration_number: null,
-            quick_login_code: null,
           }
         }
       } else {
@@ -970,6 +992,8 @@ auth.get('/me', async (c) => {
         business_name: userData.business_name || null,
         business_registration_number: userData.business_registration_number || null,
         quick_login_code: userData.quick_login_code || null,
+        gender: userData.gender || null,
+        date_of_birth: userData.date_of_birth || null,
       },
     })
   } catch (error: any) {
@@ -1129,12 +1153,12 @@ auth.patch('/profile', authMiddleware, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    const { first_name, last_name, email, password, business_name, business_registration_number } = await c.req.json()
+    const { first_name, last_name, email, password, business_name, business_registration_number, gender, date_of_birth } = await c.req.json()
 
     const adminClient = getAdminClient()
     const { data: currentUserData, error: currentUserError } = await adminClient
       .from('users')
-      .select('role, first_name, last_name, email, password_hash, business_name, business_registration_number')
+      .select('role, first_name, last_name, email, password_hash, business_name, business_registration_number, gender, date_of_birth')
       .eq('id', user.id)
       .single()
 
@@ -1224,6 +1248,50 @@ auth.patch('/profile', authMiddleware, async (c) => {
       updates.business_registration_number = newBusinessRegNumber
     }
 
+    // Handle gender and date_of_birth updates (no password required)
+    // Prevent gender changes if already set
+    if (gender !== undefined) {
+      // If gender is already set, prevent changes
+      if (currentUserData.gender) {
+        return c.json({ error: 'Gender cannot be changed once set' }, 400)
+      }
+      
+      if (gender !== 'male' && gender !== 'female') {
+        return c.json({ error: 'Gender must be either "male" or "female"' }, 400)
+      }
+      updates.gender = gender
+    }
+
+    if (date_of_birth !== undefined) {
+      if (!date_of_birth) {
+        return c.json({ error: 'Date of birth is required' }, 400)
+      }
+      
+      // Validate date format and ensure it's in the past
+      const birthDate = new Date(date_of_birth)
+      if (isNaN(birthDate.getTime())) {
+        return c.json({ error: 'Invalid date of birth format' }, 400)
+      }
+
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      if (birthDate >= today) {
+        return c.json({ error: 'Date of birth must be in the past' }, 400)
+      }
+      
+      // Validate minimum age (18 years old)
+      const { calculateAge } = await import('../utils/ageUtils.js')
+      const age = calculateAge(date_of_birth)
+      if (age === null) {
+        return c.json({ error: 'Invalid date of birth' }, 400)
+      }
+      if (age < 18) {
+        return c.json({ error: `Age must be at least 18 years old. Current age: ${age} years old` }, 400)
+      }
+      
+      updates.date_of_birth = date_of_birth
+    }
+
     if (Object.keys(updates).length === 0) {
       return c.json({ error: 'No fields to update' }, 400)
     }
@@ -1234,7 +1302,7 @@ auth.patch('/profile', authMiddleware, async (c) => {
       .from('users')
       .update(updates)
       .eq('id', user.id)
-      .select('id, email, first_name, last_name, full_name, role, business_name, business_registration_number')
+      .select('id, email, first_name, last_name, full_name, role, business_name, business_registration_number, gender, date_of_birth')
       .single()
 
     if (updateError) {

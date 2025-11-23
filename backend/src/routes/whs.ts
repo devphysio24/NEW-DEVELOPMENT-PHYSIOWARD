@@ -5,6 +5,8 @@ import { parseIncidentNotes } from '../utils/notesParser.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { normalizeDate, isDateInRange } from '../utils/dateTime.js'
 import { formatUserFullName } from '../utils/userUtils.js'
+import { calculateAge } from '../utils/ageUtils.js'
+import { encodeCursor, decodeCursor, extractCursorDate } from '../utils/cursorPagination.js'
 
 // OPTIMIZATION: Constants for active case statuses (avoid recreating array)
 const ACTIVE_CASE_STATUSES = ['new', 'triaged', 'assessed', 'in_rehab'] as const
@@ -111,18 +113,15 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
     let hasMore = false
     
     if (useCursor) {
-      // Cursor-based pagination (more efficient for large datasets)
-      const { decodeCursor, encodeCursor } = await import('../utils/pagination.js')
-      
-      // Decode cursor if provided
+      // Cursor-based pagination (efficient for large datasets)
       let cursorFilter = query.order('created_at', { ascending: false })
+      
+      // Decode and apply cursor filter if provided
       if (cursor) {
         const decoded = decodeCursor(cursor)
-        if (decoded) {
-          const cursorDate = decoded.createdAt || decoded.created_at
-          if (cursorDate) {
-            cursorFilter = cursorFilter.lt('created_at', cursorDate)
-          }
+        const cursorDate = extractCursorDate(decoded)
+        if (cursorDate) {
+          cursorFilter = cursorFilter.lt('created_at', cursorDate)
         }
       }
       
@@ -192,7 +191,7 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
     if (allUserIds.length > 0) {
       const { data: users } = await adminClient
         .from('users')
-        .select('id, email, first_name, last_name, full_name')
+        .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
         .in('id', allUserIds)
 
       if (users) {
@@ -248,7 +247,7 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
         caseStatus = 'CLOSED'
       }
 
-      // OPTIMIZATION: Generate case number using pre-calculated createdAt
+      // Generate case number (consistent with other routes)
       const year = createdAt.getFullYear()
       const month = String(createdAt.getMonth() + 1).padStart(2, '0')
       const day = String(createdAt.getDate()).padStart(2, '0')
@@ -351,8 +350,6 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
     
     if (useCursor) {
       // Cursor-based pagination response
-      const { encodeCursor } = await import('../utils/pagination.js')
-      
       let nextCursor: string | undefined = undefined
       if (hasMore && formattedCases.length > 0) {
         const lastItem = cases[cases.length - 1]
@@ -540,7 +537,7 @@ whs.get('/cases/:id', authMiddleware, requireRole(['whs_control_center']), async
       userIds.length > 0
         ? adminClient
             .from('users')
-            .select('id, email, first_name, last_name, full_name')
+            .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
             .in('id', userIds)
         : Promise.resolve({ data: [] }),
     ])
@@ -596,6 +593,8 @@ whs.get('/cases/:id', authMiddleware, requireRole(['whs_control_center']), async
       workerName: formatUserFullName(user_data || {}),
       workerEmail: user_data?.email || '',
       workerInitials: (user_data?.first_name?.[0]?.toUpperCase() || '') + (user_data?.last_name?.[0]?.toUpperCase() || '') || 'U',
+      workerGender: user_data?.gender || null,
+      workerAge: user_data?.date_of_birth ? calculateAge(user_data.date_of_birth) : null,
       teamId: caseData.team_id,
       teamName: team?.name || '',
       siteLocation: team?.site_location || '',

@@ -12,8 +12,13 @@ import { getAdminClient } from '../utils/adminClient.js'
 import { supabase } from '../lib/supabase.js'
 import { getExecutiveBusinessInfo } from '../utils/executiveHelpers.js'
 import { getTodayDateString, getStartOfWeekDateString } from '../utils/dateUtils.js'
-import { isExceptionActive } from '../utils/exceptionUtils.js'
+import { isExceptionActive, getExceptionDatesForScheduledDates } from '../utils/exceptionUtils.js'
 import { formatUserFullName } from '../utils/userUtils.js'
+import { formatDateString } from '../utils/dateTime.js'
+import { 
+  getScheduledDatesInRange, 
+  findNextScheduledDate 
+} from '../utils/scheduleUtils.js'
 
 const executive = new Hono()
 
@@ -34,7 +39,26 @@ executive.post('/users', authMiddleware, requireRole(['executive']), async (c) =
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    const { email, password, role, first_name, last_name } = await c.req.json()
+    const { email, password, role, first_name, last_name, gender, date_of_birth } = await c.req.json()
+
+    // Validate gender
+    if (gender && gender !== 'male' && gender !== 'female') {
+      return c.json({ error: 'Gender must be either "male" or "female"' }, 400)
+    }
+
+    // Validate date of birth
+    if (date_of_birth) {
+      const birthDate = new Date(date_of_birth)
+      if (isNaN(birthDate.getTime())) {
+        return c.json({ error: 'Invalid date of birth format' }, 400)
+      }
+
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      if (birthDate >= today) {
+        return c.json({ error: 'Date of birth must be in the past' }, 400)
+      }
+    }
 
     // Validate that executive can only create specific roles
     if (!role || !EXECUTIVE_MANAGED_ROLES.includes(role as any)) {
@@ -69,6 +93,8 @@ executive.post('/users', authMiddleware, requireRole(['executive']), async (c) =
       last_name,
       business_name: executiveData.business_name, // Automatically inherited from executive
       business_registration_number: executiveData.business_registration_number, // Automatically inherited from executive
+      gender: gender || undefined,
+      date_of_birth: date_of_birth || undefined,
     }
 
     // Create user using centralized function
@@ -1008,6 +1034,382 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
     return c.json({ supervisors: supervisorsWithHierarchy })
   } catch (error: any) {
     console.error('[GET /executive/hierarchy] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get workers with check-in streak data (executive only)
+executive.get('/workers/streaks', authMiddleware, requireRole(['executive']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+
+    // Get executive's business information
+    const { data: executiveData, error: executiveError } = await getExecutiveBusinessInfo(user.id)
+
+    if (executiveError || !executiveData) {
+      return c.json({ error: 'Failed to fetch executive data', details: executiveError || 'Executive business info not found' }, 500)
+    }
+
+    if (!executiveData.business_name || !executiveData.business_registration_number) {
+      return c.json({ workers: [] })
+    }
+
+    // Get all supervisors with matching business info
+    const { data: supervisors } = await adminClient
+      .from('users')
+      .select('id')
+      .eq('role', 'supervisor')
+      .eq('business_name', executiveData.business_name)
+      .eq('business_registration_number', executiveData.business_registration_number)
+
+    if (!supervisors || supervisors.length === 0) {
+      return c.json({ workers: [] })
+    }
+
+    const supervisorIds = supervisors.map(s => s.id)
+
+    // Get all teams assigned to these supervisors
+    const { data: teams } = await adminClient
+      .from('teams')
+      .select('id')
+      .in('supervisor_id', supervisorIds)
+
+    if (!teams || teams.length === 0) {
+      return c.json({ workers: [] })
+    }
+
+    const teamIds = teams.map(t => t.id)
+
+    // Get all team members (workers)
+    const { data: teamMembers } = await adminClient
+      .from('team_members')
+      .select('user_id, team_id')
+      .in('team_id', teamIds)
+
+    if (!teamMembers || teamMembers.length === 0) {
+      return c.json({ workers: [] })
+    }
+
+    const workerIds = Array.from(new Set(teamMembers.map(m => m.user_id)))
+
+    // Get worker user details
+    const { data: workers } = await adminClient
+      .from('users')
+      .select('id, email, first_name, last_name, full_name, role')
+      .in('id', workerIds)
+      .eq('role', 'worker')
+
+    if (!workers || workers.length === 0) {
+      return c.json({ workers: [] })
+    }
+
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const todayStr = getTodayDateString()
+    const thirtyDaysAgo = new Date(today)
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+    const futureEndDate = new Date(today)
+    futureEndDate.setDate(futureEndDate.getDate() + 90)
+
+    // Get all schedules for all workers
+    const { data: allSchedules } = await adminClient
+      .from('worker_schedules')
+      .select('*')
+      .in('worker_id', workerIds)
+      .eq('is_active', true)
+
+    // Get all check-ins for all workers (last 30 days)
+    const thirtyDaysAgoStr = formatDateString(thirtyDaysAgo)
+    const { data: allCheckIns } = await adminClient
+      .from('daily_checkins')
+      .select('user_id, check_in_date')
+      .in('user_id', workerIds)
+      .gte('check_in_date', thirtyDaysAgoStr)
+
+    // Get all exceptions for all workers (to check if scheduled dates have exceptions)
+    const { data: allExceptions } = await adminClient
+      .from('worker_exceptions')
+      .select('user_id, exception_type, start_date, end_date, is_active, deactivated_at, reason')
+      .in('user_id', workerIds)
+
+    // Group schedules, check-ins, and exceptions by worker
+    const schedulesByWorker = new Map<string, any[]>()
+    const checkInsByWorker = new Map<string, Set<string>>()
+    const exceptionsByWorker = new Map<string, any[]>()
+
+    if (allSchedules) {
+      allSchedules.forEach((schedule: any) => {
+        if (!schedulesByWorker.has(schedule.worker_id)) {
+          schedulesByWorker.set(schedule.worker_id, [])
+        }
+        schedulesByWorker.get(schedule.worker_id)!.push(schedule)
+      })
+    }
+
+    if (allCheckIns) {
+      allCheckIns.forEach((checkIn: any) => {
+        const dateStr = typeof checkIn.check_in_date === 'string' 
+          ? checkIn.check_in_date.split('T')[0]
+          : formatDateString(new Date(checkIn.check_in_date))
+        
+        if (!checkInsByWorker.has(checkIn.user_id)) {
+          checkInsByWorker.set(checkIn.user_id, new Set())
+        }
+        checkInsByWorker.get(checkIn.user_id)!.add(dateStr)
+      })
+    }
+
+    if (allExceptions) {
+      allExceptions.forEach((exception: any) => {
+        if (!exceptionsByWorker.has(exception.user_id)) {
+          exceptionsByWorker.set(exception.user_id, [])
+        }
+        exceptionsByWorker.get(exception.user_id)!.push(exception)
+      })
+    }
+
+    // Calculate streak for each worker
+    const workersWithStreaks = await Promise.all(workers.map(async (worker: any) => {
+      const workerSchedules = schedulesByWorker.get(worker.id) || []
+      const workerCheckIns = checkInsByWorker.get(worker.id) || new Set<string>()
+      const workerExceptions = exceptionsByWorker.get(worker.id) || []
+
+      // Get scheduled dates for past 30 days (for streak and completed days calculation)
+      const pastScheduledDates = getScheduledDatesInRange(workerSchedules, thirtyDaysAgo, today)
+      
+      // Get future scheduled dates (for total count display only)
+      const futureScheduledDates = getScheduledDatesInRange(workerSchedules, today, futureEndDate)
+      
+      // Total scheduled days includes both past and future
+      const totalScheduledDays = pastScheduledDates.size + futureScheduledDates.size
+      // Past scheduled days only (for completion percentage calculation)
+      const pastScheduledDays = pastScheduledDates.size
+
+      // Check which scheduled dates have exceptions (using centralized function)
+      const { exceptionDates, scheduledDatesWithExceptions } = getExceptionDatesForScheduledDates(
+        pastScheduledDates,
+        workerExceptions
+      )
+
+      // Calculate streak (consecutive days going backwards from today)
+      // Exception dates don't break the streak - they're treated as if the worker had no schedule
+      let currentStreak = 0
+      let tempStreak = 0
+      let foundFirstScheduledDay = false
+
+      for (let dayOffset = 0; dayOffset <= 30; dayOffset++) {
+        const checkDate = new Date(today)
+        checkDate.setDate(checkDate.getDate() - dayOffset)
+        const checkDateStr = formatDateString(checkDate)
+
+        const hadSchedule = pastScheduledDates.has(checkDateStr)
+        const hadCheckIn = workerCheckIns.has(checkDateStr)
+        const hadException = scheduledDatesWithExceptions.has(checkDateStr)
+
+        if (hadSchedule) {
+          foundFirstScheduledDay = true
+          
+          // If there's an exception on this scheduled date, don't count it (don't break streak, don't count)
+          if (hadException) {
+            // Exception dates don't break streak - continue
+            continue
+          }
+          
+          if (hadCheckIn) {
+            tempStreak++
+            if (dayOffset === 0) {
+              currentStreak = tempStreak
+            }
+          } else {
+            // No check-in and no exception - this breaks the streak
+            if (dayOffset === 0) {
+              currentStreak = 0
+              tempStreak = 0
+            } else {
+              tempStreak = 0
+            }
+          }
+        } else {
+          if (!foundFirstScheduledDay && dayOffset === 0) {
+            currentStreak = 0
+          }
+        }
+      }
+
+      // Count completed days (past days with schedule AND check-in, excluding exception dates)
+      const completedDays = Array.from(pastScheduledDates).filter(date => 
+        workerCheckIns.has(date) && !scheduledDatesWithExceptions.has(date)
+      ).length
+      
+      // Find missed schedule dates (past scheduled dates without check-in AND without exception)
+      // Exception dates should NOT be counted as missed schedules
+      const missedScheduleDates = Array.from(pastScheduledDates)
+        .filter(date => !workerCheckIns.has(date) && !scheduledDatesWithExceptions.has(date))
+        .sort()
+        .reverse() // Most recent first
+
+      // Check if worker currently has an active exception (for today)
+      const hasActiveExceptionToday = workerExceptions.some((exception: any) => {
+        return isExceptionActive(exception, today)
+      })
+
+      // Get current exception info if active
+      const currentException = hasActiveExceptionToday 
+        ? workerExceptions.find((e: any) => isExceptionActive(e, today))
+        : null
+
+      return {
+        id: worker.id,
+        email: worker.email,
+        firstName: worker.first_name,
+        lastName: worker.last_name,
+        fullName: formatUserFullName(worker),
+        currentStreak,
+        totalScheduledDays,
+        pastScheduledDays,
+        completedDays,
+        // Completion rate based on total scheduled days (past + future) assigned by team leader
+        completionPercentage: totalScheduledDays > 0 
+          ? Math.round((completedDays / totalScheduledDays) * 100) 
+          : 0,
+        hasSevenDayBadge: currentStreak >= 7,
+        missedScheduleDates,
+        missedScheduleCount: missedScheduleDates.length,
+        exceptionDates, // Dates with exceptions (separate from missed schedules)
+        hasActiveException: hasActiveExceptionToday, // Whether worker is currently in an exception
+        currentException: currentException ? {
+          exception_type: currentException.exception_type || 'other',
+          reason: currentException.reason || null,
+          start_date: currentException.start_date,
+          end_date: currentException.end_date || null,
+        } : null,
+      }
+    }))
+
+    // Sort by streak (highest first), then by completion percentage
+    workersWithStreaks.sort((a, b) => {
+      if (b.currentStreak !== a.currentStreak) {
+        return b.currentStreak - a.currentStreak
+      }
+      return b.completionPercentage - a.completionPercentage
+    })
+
+    return c.json({ workers: workersWithStreaks })
+  } catch (error: any) {
+    console.error('[GET /executive/workers/streaks] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get worker check-in history (executive only)
+executive.get('/workers/:workerId/check-ins', authMiddleware, requireRole(['executive']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const workerId = c.req.param('workerId')
+    // Allow fetching all check-ins by accepting wide date ranges
+    // If no dates provided, default to getting all check-ins
+    const startDate = c.req.query('startDate') || '2020-01-01'
+    const endDate = c.req.query('endDate') || '2099-12-31' // Future date to get all check-ins
+
+    // Normalize dates to ensure proper comparison
+    const queryStartDate = startDate || '2020-01-01'
+    const queryEndDate = endDate || '2099-12-31'
+
+    const adminClient = getAdminClient()
+
+    // Get executive's business information
+    const { data: executiveData, error: executiveError } = await getExecutiveBusinessInfo(user.id)
+
+    if (executiveError || !executiveData) {
+      console.error('[GET /executive/workers/:workerId/check-ins] Failed to get executive business info:', executiveError)
+      return c.json({ error: 'Failed to fetch executive data', details: executiveError || 'Executive business info not found' }, 500)
+    }
+
+    if (!executiveData.business_name || !executiveData.business_registration_number) {
+      return c.json({ error: 'Executive business info not configured' }, 400)
+    }
+
+    // Verify worker exists and is a worker
+    const { data: worker, error: workerError } = await adminClient
+      .from('users')
+      .select('id, role')
+      .eq('id', workerId)
+      .eq('role', 'worker')
+      .single()
+
+    if (workerError || !worker) {
+      console.error('[GET /executive/workers/:workerId/check-ins] Worker not found:', workerError)
+      return c.json({ error: 'Worker not found' }, 404)
+    }
+
+    // Verify worker belongs to executive's business by checking if worker is in a team
+    // that belongs to a supervisor with matching business info
+    const { data: teamMember } = await adminClient
+      .from('team_members')
+      .select('team_id')
+      .eq('user_id', workerId)
+      .limit(1)
+      .single()
+
+    if (!teamMember) {
+      console.error('[GET /executive/workers/:workerId/check-ins] Worker not in any team')
+      return c.json({ error: 'Worker not assigned to any team' }, 404)
+    }
+
+    // Get the team's supervisor
+    const { data: team } = await adminClient
+      .from('teams')
+      .select('supervisor_id')
+      .eq('id', teamMember.team_id)
+      .single()
+
+    if (!team || !team.supervisor_id) {
+      console.error('[GET /executive/workers/:workerId/check-ins] Team has no supervisor')
+      return c.json({ error: 'Worker team has no supervisor' }, 404)
+    }
+
+    // Verify supervisor has matching business info
+    const { data: supervisor } = await adminClient
+      .from('users')
+      .select('id, business_name, business_registration_number')
+      .eq('id', team.supervisor_id)
+      .eq('business_name', executiveData.business_name)
+      .eq('business_registration_number', executiveData.business_registration_number)
+      .single()
+
+    if (!supervisor) {
+      console.error('[GET /executive/workers/:workerId/check-ins] Supervisor business mismatch')
+      return c.json({ error: 'Unauthorized: Worker not under executive business' }, 403)
+    }
+
+    // Get check-ins for this worker (no limit to get all check-ins)
+    const { data: checkIns, error } = await adminClient
+      .from('daily_checkins')
+      .select('id, check_in_date, check_in_time, predicted_readiness, shift_type')
+      .eq('user_id', workerId)
+      .gte('check_in_date', queryStartDate)
+      .lte('check_in_date', queryEndDate)
+      .order('check_in_date', { ascending: false })
+      .order('check_in_time', { ascending: false })
+      // Removed limit to get all check-ins in the date range
+
+    if (error) {
+      console.error('[GET /executive/workers/:workerId/check-ins] Error fetching check-ins:', error)
+      return c.json({ error: 'Failed to fetch check-ins', details: error.message }, 500)
+    }
+
+    return c.json({ checkIns: checkIns || [] })
+  } catch (error: any) {
+    console.error('[GET /executive/workers/:workerId/check-ins] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
   }
 })

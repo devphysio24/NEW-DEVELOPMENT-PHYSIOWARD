@@ -73,9 +73,9 @@ export function validateStringInput(
 /**
  * Validate email format
  * @param email - Email to validate
- * @returns { valid: boolean; error?: string; value?: string }
+ * @returns { valid: boolean; error?: string }
  */
-export function validateEmail(email: any): { valid: boolean; error?: string; value?: string } {
+export function validateEmail(email: any): { valid: boolean; error?: string } {
   if (!email || typeof email !== 'string') {
     return { valid: false, error: 'Email is required' }
   }

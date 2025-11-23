@@ -1,8 +1,7 @@
 import { Context, Next } from 'hono'
-import { getCookie, setCookie } from 'hono/cookie'
+import { getCookie, getSignedCookie } from 'hono/cookie'
 import { supabase } from '../lib/supabase.js'
 import { getAdminClient } from '../utils/adminClient.js'
-import { getCookieSameSite } from '../utils/cookieHelpers.js'
 
 export interface User {
   id: string
@@ -76,16 +75,16 @@ export async function authMiddleware(c: Context<{ Variables: AuthVariables }>, n
     }
 
     if (error || !user) {
-      // Clear invalid cookies
+      // Clear invalid cookies with environment-aware security settings
+      // Match the same security settings used in setSecureCookies/clearCookies
       const isProduction = process.env.NODE_ENV === 'production'
-      const userAgent = c.req.header('user-agent')
-      const sameSite = getCookieSameSite(userAgent)
+      const sameSite = isProduction ? 'None' : 'Lax'
       const secure = isProduction
+      const secureFlag = secure ? '; Secure' : ''
       
-      setCookie(c, COOKIE_NAMES.ACCESS_TOKEN, '', { httpOnly: true, secure, sameSite, maxAge: 0, path: '/' })
-      setCookie(c, COOKIE_NAMES.REFRESH_TOKEN, '', { httpOnly: true, secure, sameSite, maxAge: 0, path: '/' })
-      setCookie(c, COOKIE_NAMES.USER_ID, '', { httpOnly: true, secure, sameSite, maxAge: 0, path: '/' })
-      
+      c.header('Set-Cookie', `${COOKIE_NAMES.ACCESS_TOKEN}=; Path=/; HttpOnly${secureFlag}; SameSite=${sameSite}; Max-Age=0`)
+      c.header('Set-Cookie', `${COOKIE_NAMES.REFRESH_TOKEN}=; Path=/; HttpOnly${secureFlag}; SameSite=${sameSite}; Max-Age=0`)
+      c.header('Set-Cookie', `${COOKIE_NAMES.USER_ID}=; Path=/; HttpOnly${secureFlag}; SameSite=${sameSite}; Max-Age=0`)
       return c.json({ error: 'Unauthorized: Invalid token' }, 401)
     }
 

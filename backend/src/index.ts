@@ -27,10 +27,8 @@ const developmentOrigins = ['http://localhost:5173', 'http://localhost:5174', 'h
 
 // Vercel preview URLs pattern - allow all Vercel preview and production URLs
 const vercelPattern = /^https:\/\/.*\.vercel\.app$/
-// Custom domain pattern - allow giodelapiedra.dev domain
-const customDomainPattern = /^https:\/\/(www\.)?giodelapiedra\.dev$/
 
-// In production, use configured origins + localhost + Vercel URLs + custom domain
+// In production, use configured origins + localhost + Vercel URLs
 // In development, use localhost origins
 const allowedOrigins = process.env.NODE_ENV === 'production'
   ? [...productionOrigins, ...developmentOrigins]
@@ -48,11 +46,6 @@ app.use('/*', cors({
     
     // In production, also allow Vercel URLs (preview and production)
     if (process.env.NODE_ENV === 'production' && vercelPattern.test(origin)) {
-      return origin
-    }
-    
-    // In production, also allow custom domain (giodelapiedra.dev)
-    if (process.env.NODE_ENV === 'production' && customDomainPattern.test(origin)) {
       return origin
     }
     

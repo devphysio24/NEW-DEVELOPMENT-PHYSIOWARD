@@ -5,6 +5,7 @@ import { parseIncidentNotes } from '../utils/notesParser.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { formatDateString, parseDateString } from '../utils/dateTime.js'
 import { getTodayDateString, dateToDateString } from '../utils/dateUtils.js'
+import { calculateAge } from '../utils/ageUtils.js'
 
 const clinician = new Hono<{ Variables: AuthVariables }>()
 
@@ -412,7 +413,7 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
     if (allUserIds.length > 0) {
       const { data: users } = await adminClient
         .from('users')
-        .select('id, email, first_name, last_name, full_name')
+        .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
         .in('id', allUserIds)
 
       if (users) {
@@ -472,6 +473,8 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
         workerName: formatUserName(user),
         workerEmail: user?.email || '',
         workerInitials: user?.first_name?.[0]?.toUpperCase() + user?.last_name?.[0]?.toUpperCase() || 'U',
+        workerGender: user?.gender || null,
+        workerAge: user?.date_of_birth ? calculateAge(user.date_of_birth) : null,
         teamId: incident.team_id,
         teamName: team?.name || '',
         siteLocation: team?.site_location || '',
@@ -663,7 +666,7 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
       userIds.length > 0
         ? adminClient
             .from('users')
-            .select('id, email, first_name, last_name, full_name')
+            .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
             .in('id', userIds)
         : Promise.resolve({ data: [] }),
       
@@ -715,6 +718,8 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
       workerName: formatUserName(user_data),
       workerEmail: user_data?.email || '',
       workerInitials: (user_data?.first_name?.[0]?.toUpperCase() || '') + (user_data?.last_name?.[0]?.toUpperCase() || '') || 'U',
+      workerGender: user_data?.gender || null,
+      workerAge: user_data?.date_of_birth ? calculateAge(user_data.date_of_birth) : null,
       teamId: caseData.team_id,
       teamName: team?.name || '',
       siteLocation: team?.site_location || '',
@@ -2513,23 +2518,10 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
       return c.json({ error: 'Appointment not found or not authorized' }, 404)
     }
 
-    // Build update object - IMPORTANT: Update status first if provided, then date
-    // This ensures the constraint sees the correct status when validating the date
+    // Build update object
     const updateData: any = {
       updated_at: new Date().toISOString(),
     }
-
-    // Update status first if provided (needed for constraint validation)
-    if (updates.status) {
-      const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled', 'declined']
-      if (!validStatuses.includes(updates.status)) {
-        return c.json({ error: `status must be one of: ${validStatuses.join(', ')}` }, 400)
-      }
-      updateData.status = updates.status
-    }
-
-    // Get the status that will be used (new status or current status)
-    const effectiveStatus = updates.status || appointment.status
 
     if (updates.appointment_date) {
       const dateValidation = validateDateInput(updates.appointment_date)
@@ -2546,8 +2538,9 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
       // Check if appointment date is in the past
       const isPastDate = appointmentDateObj < today
       
-      // Determine if past dates are allowed based on effective status
-      const allowsPastDate = ['completed', 'cancelled', 'declined'].includes(effectiveStatus)
+      // Get current or new status to determine if past dates are allowed
+      const newStatus = updates.status || appointment.status
+      const allowsPastDate = ['completed', 'cancelled', 'declined'].includes(newStatus)
       
       // If date is in the past and status doesn't allow it, return error
       if (isPastDate && !allowsPastDate) {
@@ -2574,6 +2567,14 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
         return c.json({ error: 'duration_minutes must be between 15 and 480' }, 400)
       }
       updateData.duration_minutes = duration
+    }
+
+    if (updates.status) {
+      const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled', 'declined']
+      if (!validStatuses.includes(updates.status)) {
+        return c.json({ error: `status must be one of: ${validStatuses.join(', ')}` }, 400)
+      }
+      updateData.status = updates.status
     }
 
     if (updates.appointment_type) {
@@ -2605,32 +2606,6 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
 
     if (updateError) {
       console.error('[PATCH /clinician/appointments/:id] Error:', updateError)
-      
-      // Handle constraint violation specifically
-      if (updateError.code === '23514' && updateError.message?.includes('appointment_date_not_past')) {
-        // If updating to past date, ensure status allows it
-        const isUpdatingDate = updates.appointment_date !== undefined
-        const isUpdatingStatus = updates.status !== undefined
-        const effectiveStatus = updates.status || appointment.status
-        const allowsPastDate = ['completed', 'cancelled', 'declined'].includes(effectiveStatus)
-        
-        if (isUpdatingDate && !isUpdatingStatus && !allowsPastDate) {
-          return c.json({ 
-            error: 'Cannot set appointment date in the past for pending or confirmed appointments. Please update the status to completed, cancelled, or declined first.',
-            code: 'PAST_DATE_NOT_ALLOWED'
-          }, 400)
-        }
-        
-        // If status already allows past dates, the migration might not be run
-        if (allowsPastDate) {
-          return c.json({ 
-            error: 'Database constraint error. Please ensure the migration "migration_fix_appointment_date_constraint.sql" has been run.',
-            code: 'CONSTRAINT_ERROR',
-            details: 'The appointment date constraint may need to be updated to allow past dates for completed/cancelled/declined appointments.'
-          }, 500)
-        }
-      }
-      
       return c.json({ error: 'Failed to update appointment', details: updateError.message }, 500)
     }
 

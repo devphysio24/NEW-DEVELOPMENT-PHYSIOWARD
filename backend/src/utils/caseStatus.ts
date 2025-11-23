@@ -27,19 +27,6 @@ export function isValidCaseStatus(status: string): status is CaseStatus {
 }
 
 /**
- * Get display label for a case status
- * @param status - Internal status value
- * @returns Display label or uppercase status if not found
- */
-export function getCaseStatusDisplayLabel(status: string): string {
-  if (isValidCaseStatus(status)) {
-    return STATUS_DISPLAY_MAP[status]
-  }
-  // Fallback: sanitize and uppercase
-  return status.toUpperCase().trim()
-}
-
-/**
  * Extract case_status from notes field securely
  * @param notes - Notes field value (can be JSON string or plain text)
  * @returns Case status or null if not found/invalid

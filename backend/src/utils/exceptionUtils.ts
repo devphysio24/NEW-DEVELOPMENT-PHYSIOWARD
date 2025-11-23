@@ -10,6 +10,7 @@ export interface WorkerException {
   deactivated_at?: string | null
   is_active?: boolean
   exception_type?: string
+  reason?: string | null
   user_id?: string
 }
 
@@ -175,5 +176,51 @@ export const EXCEPTION_TYPE_LABELS: Record<string, string> = {
  */
 export function getExceptionTypeLabel(exceptionType: string): string {
   return EXCEPTION_TYPE_LABELS[exceptionType] || exceptionType
+}
+
+/**
+ * Check which scheduled dates have active exceptions
+ * Centralized function to avoid duplication
+ * @param scheduledDates - Set of scheduled date strings (YYYY-MM-DD)
+ * @param exceptions - Array of worker exceptions
+ * @returns Object with exceptionDates array and scheduledDatesWithExceptions Set
+ */
+export function getExceptionDatesForScheduledDates(
+  scheduledDates: Set<string>,
+  exceptions: WorkerException[]
+): {
+  exceptionDates: Array<{ date: string; exception_type: string; reason: string | null }>
+  scheduledDatesWithExceptions: Set<string>
+} {
+  const exceptionDates: Array<{ date: string; exception_type: string; reason: string | null }> = []
+  const scheduledDatesWithExceptions = new Set<string>()
+
+  if (!exceptions || exceptions.length === 0) {
+    return { exceptionDates, scheduledDatesWithExceptions }
+  }
+
+  scheduledDates.forEach((scheduledDate) => {
+    const scheduledDateObj = new Date(scheduledDate + 'T00:00:00')
+    const hasException = exceptions.some((exception) => {
+      return isExceptionActive(exception, scheduledDateObj)
+    })
+
+    if (hasException) {
+      const exception = exceptions.find((e) => isExceptionActive(e, scheduledDateObj))
+      if (exception) {
+        exceptionDates.push({
+          date: scheduledDate,
+          exception_type: exception.exception_type || 'other',
+          reason: exception.reason || null,
+        })
+        scheduledDatesWithExceptions.add(scheduledDate)
+      }
+    }
+  })
+
+  // Sort exception dates (most recent first)
+  exceptionDates.sort((a, b) => b.date.localeCompare(a.date))
+
+  return { exceptionDates, scheduledDatesWithExceptions }
 }
 

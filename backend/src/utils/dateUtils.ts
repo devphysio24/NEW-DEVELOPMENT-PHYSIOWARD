@@ -48,16 +48,8 @@ export function dateToDateString(date: Date): string {
   return date.toISOString().split('T')[0]
 }
 
-/**
- * Normalize date to start of day (00:00:00)
- * @param date - Date to normalize
- * @returns Normalized date
- */
-export function normalizeDate(date: Date): Date {
-  const normalized = new Date(date)
-  normalized.setHours(0, 0, 0, 0)
-  return normalized
-}
+// normalizeDate removed - use normalizeDate from '../utils/dateTime.js' instead
+// This avoids duplication and centralizes date normalization logic
 
 /**
  * Check if a date string is valid

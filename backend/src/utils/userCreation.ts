@@ -7,6 +7,7 @@
 import bcrypt from 'bcrypt'
 import { supabase } from '../lib/supabase.js'
 import { getAdminClient } from './adminClient.js'
+import { calculateAge } from './ageUtils.js'
 
 export interface CreateUserInput {
   email: string
@@ -16,6 +17,8 @@ export interface CreateUserInput {
   last_name: string
   business_name?: string
   business_registration_number?: string
+  gender?: 'male' | 'female'
+  date_of_birth?: string
 }
 
 export interface CreateUserResult {
@@ -29,7 +32,7 @@ export interface CreateUserResult {
  * Validates user creation input
  */
 export function validateUserInput(input: CreateUserInput): { valid: boolean; error?: string } {
-  const { email, password, role, first_name, last_name, business_name, business_registration_number } = input
+  const { email, password, role, first_name, last_name, business_name, business_registration_number, gender, date_of_birth } = input
 
   // Validate required fields
   if (!email || !password) {
@@ -38,6 +41,34 @@ export function validateUserInput(input: CreateUserInput): { valid: boolean; err
 
   if (!first_name || !last_name) {
     return { valid: false, error: 'First name and last name are required' }
+  }
+
+  // Validate gender
+  if (gender && gender !== 'male' && gender !== 'female') {
+    return { valid: false, error: 'Gender must be either "male" or "female"' }
+  }
+
+  // Validate date of birth
+  if (date_of_birth) {
+    const birthDate = new Date(date_of_birth)
+    if (isNaN(birthDate.getTime())) {
+      return { valid: false, error: 'Invalid date of birth format' }
+    }
+
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    if (birthDate >= today) {
+      return { valid: false, error: 'Date of birth must be in the past' }
+    }
+    
+    // Validate minimum age (18 years old)
+    const age = calculateAge(date_of_birth)
+    if (age === null) {
+      return { valid: false, error: 'Invalid date of birth' }
+    }
+    if (age < 18) {
+      return { valid: false, error: `Age must be at least 18 years old. Current age: ${age} years old` }
+    }
   }
 
   // Trim and validate names
@@ -93,7 +124,7 @@ export async function createUserAccount(input: CreateUserInput): Promise<CreateU
       return { success: false, error: validation.error }
     }
 
-    const { email, password, role, first_name, last_name, business_name, business_registration_number } = input
+    const { email, password, role, first_name, last_name, business_name, business_registration_number, gender, date_of_birth } = input
 
     // Normalize inputs
     const trimmedFirstName = first_name.trim()
@@ -148,6 +179,14 @@ export async function createUserAccount(input: CreateUserInput): Promise<CreateU
       full_name: fullName,
       password_hash: hashedPassword,
       created_at: new Date().toISOString(),
+    }
+
+    // Add gender and date_of_birth if provided
+    if (gender) {
+      userInsertData.gender = gender
+    }
+    if (date_of_birth) {
+      userInsertData.date_of_birth = date_of_birth
     }
 
     // Handle business info based on role

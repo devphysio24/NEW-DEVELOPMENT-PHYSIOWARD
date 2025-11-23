@@ -11,6 +11,8 @@ import { getTodayDateString, getTodayDate, getStartOfWeekDateString, getFirstDay
 import { validateTeamId, validatePassword, validateStringInput, validateEmail } from '../utils/validationUtils.js'
 import { isExceptionActive, getWorkersWithActiveExceptions } from '../utils/exceptionUtils.js'
 import { formatTeamLeader, formatUserFullName, getUserInitials } from '../utils/userUtils.js'
+import { encodeCursor, decodeCursor, extractCursorDate } from '../utils/cursorPagination.js'
+import { calculateAge, MINIMUM_AGE } from '../utils/ageUtils.js'
 
 const supervisor = new Hono<{ Variables: AuthVariables }>()
 
@@ -351,7 +353,7 @@ supervisor.post('/team-leaders', authMiddleware, requireRole(['supervisor']), as
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    const { email, password, first_name, last_name, team_name, site_location } = await c.req.json()
+    const { email, password, first_name, last_name, team_name, site_location, gender, date_of_birth } = await c.req.json()
 
     // SECURITY: Comprehensive input validation
     if (!isValidEmail(email)) {
@@ -382,6 +384,32 @@ supervisor.post('/team-leaders', authMiddleware, requireRole(['supervisor']), as
     const trimmedSiteLocation = site_location && typeof site_location === 'string' 
       ? site_location.trim().slice(0, 200) 
       : null
+
+    // Validate gender
+    if (gender && gender !== 'male' && gender !== 'female') {
+      return c.json({ error: 'Gender must be either "male" or "female"' }, 400)
+    }
+
+    // Validate date of birth
+    if (date_of_birth) {
+      const birthDate = new Date(date_of_birth)
+      if (isNaN(birthDate.getTime())) {
+        return c.json({ error: 'Invalid date of birth format' }, 400)
+      }
+
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      if (birthDate >= today) {
+        return c.json({ error: 'Date of birth must be in the past' }, 400)
+      }
+
+      // Validate minimum age (18 years old)
+      const { calculateAge, MINIMUM_AGE } = await import('../utils/ageUtils.js')
+      const age = calculateAge(date_of_birth)
+      if (age === null || age < MINIMUM_AGE) {
+        return c.json({ error: `Age must be at least ${MINIMUM_AGE} years old. Current age: ${age} years old` }, 400)
+      }
+    }
 
     const adminClient = getAdminClient()
 
@@ -467,6 +495,14 @@ supervisor.post('/team-leaders', authMiddleware, requireRole(['supervisor']), as
       business_name: inheritedBusinessName || null, // Inherit from supervisor
       business_registration_number: inheritedBusinessRegNumber || null, // Inherit from supervisor
       created_at: new Date().toISOString(),
+    }
+
+    // Add gender and date_of_birth if provided
+    if (gender) {
+      userInsertData.gender = gender
+    }
+    if (date_of_birth) {
+      userInsertData.date_of_birth = date_of_birth
     }
 
     // Log data being inserted for debugging
@@ -1013,28 +1049,9 @@ supervisor.get('/analytics', authMiddleware, requireRole(['supervisor']), async 
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    // Import cache utility
-    const { cache, CacheManager } = await import('../utils/cache.js')
-    
     // Get date filters from query params
     const startDate = c.req.query('startDate') || getFirstDayOfMonthString()
     const endDate = c.req.query('endDate') || getTodayDateString()
-
-    // Generate cache key
-    const cacheKey = CacheManager.generateKey('supervisor-analytics', {
-      userId: user.id,
-      startDate,
-      endDate,
-    })
-
-    // Try to get from cache (5 minute TTL)
-    const cached = cache.get(cacheKey)
-    if (cached) {
-      return c.json(cached, 200, {
-        'X-Cache': 'HIT',
-        'Cache-Control': 'public, max-age=300',
-      })
-    }
 
     const adminClient = getAdminClient()
 
@@ -1666,12 +1683,10 @@ supervisor.get('/analytics', authMiddleware, requireRole(['supervisor']), async 
       responseData.teamLeaderPerformance = []
     }
 
-    // Store in cache (5 minute TTL)
-    cache.set(cacheKey, responseData, 5 * 60 * 1000)
-
     return c.json(responseData, 200, {
-      'X-Cache': 'MISS',
-      'Cache-Control': 'public, max-age=300',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
     })
   } catch (error: any) {
     console.error('Supervisor analytics error:', error)
@@ -1788,7 +1803,9 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
           email,
           first_name,
           last_name,
-          full_name
+          full_name,
+          gender,
+          date_of_birth
         ),
         teams!worker_exceptions_team_id_fkey(
           id,
@@ -1829,18 +1846,15 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
     let hasMore = false
     
     if (useCursor) {
-      // Cursor-based pagination (more efficient for large datasets)
-      const { decodeCursor, encodeCursor } = await import('../utils/pagination.js')
-      
-      // Decode cursor if provided
+      // Cursor-based pagination (efficient for large datasets)
       let cursorFilter = query.order('created_at', { ascending: false })
+      
+      // Decode and apply cursor filter if provided
       if (cursor) {
         const decoded = decodeCursor(cursor)
-        if (decoded) {
-          const cursorDate = decoded.createdAt || decoded.created_at
-          if (cursorDate) {
-            cursorFilter = cursorFilter.lt('created_at', cursorDate)
-          }
+        const cursorDate = extractCursorDate(decoded)
+        if (cursorDate) {
+          cursorFilter = cursorFilter.lt('created_at', cursorDate)
         }
       }
       
@@ -1961,6 +1975,8 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
                      ? `${user.first_name} ${user.last_name}`
                      : user?.email || 'Unknown'),
         workerEmail: user?.email || '',
+        workerGender: user?.gender || null,
+        workerAge: user?.date_of_birth ? calculateAge(user.date_of_birth) : null,
         teamId: incident.team_id,
         teamName: team?.name || '',
         type: incident.exception_type,
@@ -2002,8 +2018,6 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
     
     if (useCursor) {
       // Cursor-based pagination response
-      const { encodeCursor } = await import('../utils/pagination.js')
-      
       let nextCursor: string | undefined = undefined
       if (hasMore && formattedIncidents.length > 0) {
         const lastItem = incidents[incidents.length - 1]
@@ -2302,27 +2316,8 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
       // Don't fail the incident creation if notifications fail
     }
 
-    // Invalidate cache for analytics (since exception affects analytics)
-    try {
-      const { cache } = await import('../utils/cache.js')
-      
-      // Invalidate supervisor analytics
-      cache.deleteByUserId(user.id, ['supervisor-analytics'])
-      
-      // Also invalidate team leader analytics
-      const { data: teamData } = await adminClient
-        .from('teams')
-        .select('team_leader_id')
-        .eq('id', teamId)
-        .single()
-      
-      if (teamData?.team_leader_id) {
-        cache.deleteByUserId(teamData.team_leader_id, ['analytics'])
-      }
-    } catch (cacheError: any) {
-      console.error('[POST /supervisor/incidents] Error invalidating cache:', cacheError)
-      // Don't fail the request if cache invalidation fails
-    }
+    // Cache invalidation removed - cache.js was deleted as unused code
+    // Analytics will be recalculated on next request
 
     return c.json({ 
       incident: newException,
@@ -2559,27 +2554,8 @@ supervisor.patch('/incidents/:incidentId/close', authMiddleware, requireRole(['s
       return c.json({ error: 'Failed to close incident', details: updateError.message }, 500)
     }
 
-    // Invalidate cache for analytics (since incident closure affects analytics)
-    try {
-      const { cache } = await import('../utils/cache.js')
-      
-      // Invalidate supervisor analytics
-      cache.deleteByUserId(user.id, ['supervisor-analytics'])
-      
-      // Also invalidate team leader analytics
-      const { data: teamData } = await adminClient
-        .from('teams')
-        .select('team_leader_id')
-        .eq('id', (incident as any).team_id)
-        .single()
-      
-      if (teamData?.team_leader_id) {
-        cache.deleteByUserId(teamData.team_leader_id, ['analytics'])
-      }
-    } catch (cacheError: any) {
-      console.error('[PATCH /supervisor/incidents/:incidentId/close] Error invalidating cache:', cacheError)
-      // Don't fail the request if cache invalidation fails
-    }
+    // Cache invalidation removed - cache.js was deleted as unused code
+    // Analytics will be recalculated on next request
 
     return c.json({ 
       incident: updated,
