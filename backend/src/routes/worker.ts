@@ -4,19 +4,22 @@ import { getCaseStatusFromNotes } from '../utils/caseStatus.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { analyzeIncident } from '../utils/openai.js'
 import { getTodayDateString } from '../utils/dateUtils.js'
-import { formatDateString } from '../utils/dateTime.js'
+import { formatDateString, compareTime } from '../utils/dateTime.js'
 import { getExceptionDatesForScheduledDates } from '../utils/exceptionUtils.js'
+import { ROLES } from '../constants/roles.js'
 import { 
   getScheduledDatesInRange, 
   findNextScheduledDate, 
   formatDateForDisplay 
 } from '../utils/scheduleUtils.js'
 import { calculateAge } from '../utils/ageUtils.js'
+import { uploadIncidentPhoto } from '../utils/r2Upload.js'
+import { getSafeExtension, validateImageFile } from '../utils/imageValidation.js'
 
 const worker = new Hono()
 
 // Check if worker can submit incident report (check for active exceptions)
-worker.get('/can-report-incident', authMiddleware, requireRole(['worker']), async (c) => {
+worker.get('/can-report-incident', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -73,15 +76,68 @@ worker.get('/can-report-incident', authMiddleware, requireRole(['worker']), asyn
 })
 
 // AI Analyze Incident Report (analyze before submitting)
-worker.post('/analyze-incident', authMiddleware, requireRole(['worker']), async (c) => {
+// Supports both JSON body (text-only) and FormData (with image)
+worker.post('/analyze-incident', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    const body = await c.req.json()
-    const { type, description, location, severity, date } = body
+    let type: string
+    let description: string
+    let location: string
+    let severity: string
+    let date: string
+    let imageBase64: string | undefined
+    let imageMimeType: string | undefined
+
+    // Check content type to determine how to parse the request
+    const contentType = c.req.header('content-type') || ''
+    
+    if (contentType.includes('multipart/form-data')) {
+      // Parse FormData (with potential image)
+      const formData = await c.req.formData()
+      type = formData.get('type') as string
+      description = formData.get('description') as string
+      location = formData.get('location') as string
+      severity = formData.get('severity') as string
+      date = formData.get('date') as string
+      
+      // Handle image if provided
+      const photo = formData.get('photo') as File | null
+      if (photo && photo.size > 0) {
+        try {
+          // Validate image
+          const validation = validateImageFile(photo)
+          if (!validation.valid) {
+            console.warn('[POST /worker/analyze-incident] Image validation failed:', validation.error)
+            // Continue without image - don't fail the analysis
+          } else {
+            // Convert to base64 for AI analysis
+            const arrayBuffer = await photo.arrayBuffer()
+            const buffer = Buffer.from(arrayBuffer)
+            imageBase64 = buffer.toString('base64')
+            imageMimeType = photo.type || 'image/jpeg'
+            console.log('[POST /worker/analyze-incident] Image included for analysis:', {
+              size: photo.size,
+              type: imageMimeType
+            })
+          }
+        } catch (imgError: any) {
+          console.error('[POST /worker/analyze-incident] Error processing image:', imgError)
+          // Continue without image
+        }
+      }
+    } else {
+      // Parse JSON body (text-only)
+      const body = await c.req.json()
+      type = body.type
+      description = body.description
+      location = body.location
+      severity = body.severity
+      date = body.date
+    }
 
     // Validation
     if (!type || !description || !location || !severity || !date) {
@@ -98,18 +154,21 @@ worker.post('/analyze-incident', authMiddleware, requireRole(['worker']), async 
       return c.json({ error: 'Invalid severity' }, 400)
     }
 
-    // Perform AI analysis
+    // Perform AI analysis (with optional image)
     const analysis = await analyzeIncident({
-      type,
+      type: type as 'incident' | 'near_miss',
       description,
       location,
-      severity,
+      severity: severity as 'low' | 'medium' | 'high' | 'critical',
       date,
+      imageBase64,
+      imageMimeType,
     })
 
     return c.json({
       success: true,
       analysis,
+      hasImageAnalysis: !!imageBase64,
     })
 
   } catch (error: any) {
@@ -122,7 +181,7 @@ worker.post('/analyze-incident', authMiddleware, requireRole(['worker']), async 
 })
 
 // Report Incident or Near-Miss
-worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (c) => {
+worker.post('/report-incident', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -136,6 +195,7 @@ worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (
     const location = formData.get('location') as string
     const severity = formData.get('severity') as string || 'medium'
     const photo = formData.get('photo') as File | null
+    const aiAnalysisResult = formData.get('ai_analysis_result') as string | null
 
     // Validation
     if (!type || !description || !incidentDate || !location) {
@@ -229,7 +289,7 @@ worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (
     }
 
     // Also check for active incidents (in case it's not synced with exceptions)
-    const today = new Date().toISOString().split('T')[0]
+    const today = getTodayDateString()
     const { data: activeIncident, error: incidentError } = await adminClient
       .from('incidents')
       .select('id, incident_type, incident_date, severity')
@@ -255,42 +315,37 @@ worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (
       }
     }
 
-    // Handle photo upload if provided
-    let photoUrl: string | null = null
-    if (photo && photo.size > 0) {
-      try {
-        // Convert file to base64 for storage
-        const arrayBuffer = await photo.arrayBuffer()
-        const buffer = Buffer.from(arrayBuffer)
-        const base64 = buffer.toString('base64')
-        const dataUrl = `data:${photo.type};base64,${base64}`
-
-        // Store in Supabase Storage (if configured) or store as base64 in notes
-        // For now, we'll store it in the notes field as a reference
-        // In production, you'd want to upload to Supabase Storage
-        photoUrl = dataUrl // Store reference - in production, upload to storage and get URL
-      } catch (photoError: any) {
-        console.error('[POST /worker/report-incident] Error processing photo:', photoError)
-        // Don't fail the incident creation if photo processing fails
-      }
-    }
-
     // Determine exception type based on report type
     // For incident/near_miss reports, we'll use 'accident' or 'other' as exception type
     const exceptionType = type === 'incident' ? 'accident' : 'other'
 
-    // Create incident record in incidents table
+    // Parse AI analysis result if provided
+    let parsedAiAnalysis: any = null
+    if (aiAnalysisResult) {
+      try {
+        parsedAiAnalysis = JSON.parse(aiAnalysisResult)
+      } catch (parseError: any) {
+        console.error('[POST /worker/report-incident] Error parsing AI analysis result:', parseError)
+        // Continue without AI analysis if parsing fails
+      }
+    }
+
+    // Create incident record first to get the ID for photo naming
     const incidentData: any = {
       user_id: user.id,
       team_id: teamId,
       incident_type: type,
       incident_date: incidentDate,
-      description: `${description}${location ? `\n\nLocation: ${location}` : ''}${photoUrl ? '\n\n[Photo attached]' : ''}`,
+      description: `${description}${location ? `\n\nLocation: ${location}` : ''}`,
       severity: severity,
+      ai_analysis_result: parsedAiAnalysis,
+      photo_url: null, // Will be updated after upload
     }
 
     // Insert into incidents table
     let incidentId: string | null = null
+    let photoUrl: string | null = null
+    
     try {
       const { data: incident, error: incidentError } = await adminClient
         .from('incidents')
@@ -300,6 +355,44 @@ worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (
 
       if (!incidentError && incident) {
         incidentId = incident.id
+        
+        // Upload photo to R2 after we have the incident ID
+        if (photo && photo.size > 0) {
+          try {
+            // Validate image file
+            const validation = validateImageFile(photo)
+            if (!validation.valid) {
+              console.warn('[POST /worker/report-incident] Image validation failed:', validation.error)
+            } else {
+              // Get file extension
+              const fileExtension = getSafeExtension(photo.name || 'image.jpg')
+              
+              // Convert to buffer
+              const arrayBuffer = await photo.arrayBuffer()
+              const buffer = Buffer.from(arrayBuffer)
+              
+              // Upload to R2
+              photoUrl = await uploadIncidentPhoto(buffer, user.id, incidentId, fileExtension)
+              console.log('[POST /worker/report-incident] Photo uploaded to R2:', photoUrl)
+              
+              // Update incident with photo URL
+              const { error: updateError } = await adminClient
+                .from('incidents')
+                .update({ 
+                  photo_url: photoUrl,
+                  description: `${description}${location ? `\n\nLocation: ${location}` : ''}\n\n[Photo attached]`
+                })
+                .eq('id', incidentId)
+              
+              if (updateError) {
+                console.error('[POST /worker/report-incident] Error updating incident with photo URL:', updateError)
+              }
+            }
+          } catch (photoError: any) {
+            console.error('[POST /worker/report-incident] Error uploading photo to R2:', photoError)
+            // Don't fail the incident creation if photo upload fails
+          }
+        }
       } else if (incidentError) {
         console.error('[POST /worker/report-incident] Error creating incident:', incidentError)
         // Continue with exception creation even if incident creation fails
@@ -319,7 +412,7 @@ worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (
       end_date: null,
       is_active: true,
       created_by: user.id,
-      notes: photoUrl ? `Photo attached: ${photoUrl.substring(0, 100)}...` : null,
+      notes: photoUrl ? `Photo URL: ${photoUrl}` : null,
     }
 
     const { data: newException, error: createError } = await adminClient
@@ -456,7 +549,7 @@ worker.post('/report-incident', authMiddleware, requireRole(['worker']), async (
 })
 
 // Get worker's cases (accidents/incidents) - VIEW ONLY
-worker.get('/cases', authMiddleware, requireRole(['worker']), async (c) => {
+worker.get('/cases', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -691,7 +784,7 @@ worker.get('/cases', authMiddleware, requireRole(['worker']), async (c) => {
 })
 
 // Get single case detail for worker - VIEW ONLY
-worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
+worker.get('/cases/:id', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -800,6 +893,29 @@ worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
       .eq('id', user.id)
       .single()
 
+    // Fetch incident data (photo_url and ai_analysis_result) for this case
+    // Match by user_id and incident_date (which corresponds to start_date of exception)
+    let incidentPhotoUrl: string | null = null
+    let incidentAiAnalysis: any = null
+    
+    const { data: incidentData } = await adminClient
+      .from('incidents')
+      .select('id, photo_url, ai_analysis_result, incident_date')
+      .eq('user_id', caseData.user_id)
+      .eq('incident_date', caseData.start_date)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    
+    if (incidentData) {
+      // Use proxy URL instead of direct R2 URL for better compatibility
+      // The proxy endpoint handles fetching from R2
+      if (incidentData.photo_url) {
+        incidentPhotoUrl = `/api/worker/incident-photo/${incidentData.id}`
+      }
+      incidentAiAnalysis = incidentData.ai_analysis_result || null
+    }
+
     const formattedCase = {
       id: caseData.id,
       caseNumber: generateCaseNumber(caseData.id, caseData.created_at),
@@ -828,6 +944,9 @@ worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
       updatedAt: caseData.updated_at,
       return_to_work_duty_type: caseData.return_to_work_duty_type || null,
       return_to_work_date: caseData.return_to_work_date || null,
+      // Incident data (photo and AI analysis)
+      incidentPhotoUrl,
+      incidentAiAnalysis,
     }
 
     return c.json({ case: formattedCase }, 200)
@@ -838,7 +957,7 @@ worker.get('/cases/:id', authMiddleware, requireRole(['worker']), async (c) => {
 })
 
 // Get worker's check-in streak
-worker.get('/streak', authMiddleware, requireRole(['worker']), async (c) => {
+worker.get('/streak', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -853,7 +972,7 @@ worker.get('/streak', authMiddleware, requireRole(['worker']), async (c) => {
     // Get all active schedules for this worker
     const { data: schedules, error: scheduleError } = await adminClient
       .from('worker_schedules')
-      .select('*')
+      .select('id, worker_id, team_id, scheduled_date, day_of_week, start_time, end_time, effective_date, expiry_date, is_active, requires_daily_checkin, daily_checkin_start_time, daily_checkin_end_time, created_at, updated_at')
       .eq('worker_id', user.id)
       .eq('is_active', true)
       .order('scheduled_date', { ascending: false })
@@ -998,8 +1117,64 @@ worker.get('/streak', authMiddleware, requireRole(['worker']), async (c) => {
     
     // Find missed schedule dates (past scheduled dates without check-in AND without exception)
     // Exception dates should NOT be counted as missed schedules
+    // IMPORTANT: Today should NOT be counted as missed unless the check-in window has already closed
+    const now = new Date()
+    const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
+    
+    // Get today's schedule to check if check-in window has closed
+    let todaySchedule = null
+    if (pastScheduledDates.has(todayStr) && schedules) {
+      // Find today's schedule (check both single-date and recurring)
+      const todayDayOfWeek = today.getDay()
+      todaySchedule = schedules.find((schedule: any) => {
+        // Check single-date schedule
+        if (schedule.scheduled_date === todayStr) {
+          return true
+        }
+        // Check recurring schedule
+        if (schedule.day_of_week === todayDayOfWeek) {
+          // Check if within effective date range
+          const effectiveDate = schedule.effective_date ? new Date(schedule.effective_date) : null
+          const expiryDate = schedule.expiry_date ? new Date(schedule.expiry_date) : null
+          if (effectiveDate && today < effectiveDate) return false
+          if (expiryDate && today > expiryDate) return false
+          return true
+        }
+        return false
+      })
+    }
+    
+    // Check if today's check-in window has closed
+    let todayWindowClosed = false
+    if (todaySchedule && todaySchedule.requires_daily_checkin && todaySchedule.daily_checkin_end_time) {
+      // Window has closed if current time is past the end time
+      todayWindowClosed = compareTime(currentTime, todaySchedule.daily_checkin_end_time) > 0
+    } else if (todaySchedule && !todaySchedule.requires_daily_checkin) {
+      // If schedule doesn't require daily check-in, consider window closed at end of day (23:59)
+      todayWindowClosed = compareTime(currentTime, '23:59') > 0
+    }
+    
     const missedScheduleDates = Array.from(pastScheduledDates)
-      .filter(date => !checkInDates.has(date) && !scheduledDatesWithExceptions.has(date))
+      .filter(date => {
+        // Skip if has check-in or exception
+        if (checkInDates.has(date) || scheduledDatesWithExceptions.has(date)) {
+          return false
+        }
+        
+        // CRITICAL: Only count dates that are in the past or today (not future dates)
+        // Skip any date that is after today
+        if (date > todayStr) {
+          return false
+        }
+        
+        // For today: only count as missed if window has closed
+        if (date === todayStr) {
+          return todayWindowClosed
+        }
+        
+        // For past dates (before today): count as missed if no check-in and no exception
+        return true
+      })
       .sort()
       .reverse() // Most recent first
     
@@ -1066,6 +1241,53 @@ worker.get('/streak', authMiddleware, requireRole(['worker']), async (c) => {
   } catch (error: any) {
     console.error('[GET /worker/streak] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Proxy endpoint for incident photos (centralized R2 fetch utility)
+// Security: Validates incident exists and has photo before serving
+worker.get('/incident-photo/:incidentId', async (c) => {
+  try {
+    const incidentId = c.req.param('incidentId')
+    if (!incidentId) {
+      return c.json({ error: 'Incident ID is required' }, 400)
+    }
+
+    // Security: Validate UUID format to prevent injection
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    if (!uuidRegex.test(incidentId)) {
+      return c.json({ error: 'Invalid incident ID format' }, 400)
+    }
+
+    // Get incident's photo URL from database
+    const adminClient = getAdminClient()
+    const { data: incident, error: incidentError } = await adminClient
+      .from('incidents')
+      .select('photo_url')
+      .eq('id', incidentId)
+      .single()
+
+    if (incidentError || !incident) {
+      return c.json({ error: 'Incident not found' }, 404)
+    }
+
+    if (!incident.photo_url) {
+      return c.json({ error: 'No photo found for this incident' }, 404)
+    }
+
+    // Use centralized R2 utility
+    const { extractR2Key, fetchImageFromR2, createImageProxyResponse } = await import('../utils/r2Upload.js')
+    
+    const key = extractR2Key(incident.photo_url, 'incidents')
+    const ifNoneMatch = c.req.header('If-None-Match')
+    
+    // Fetch from R2 with security validation (only allow incidents/ prefix)
+    const result = await fetchImageFromR2(key, ['incidents/'], ifNoneMatch)
+    
+    return createImageProxyResponse(result)
+  } catch (error: any) {
+    console.error('[GET /worker/incident-photo/:incidentId] Error:', error)
+    return c.json({ error: 'Failed to fetch image', details: error.message }, 500)
   }
 })
 

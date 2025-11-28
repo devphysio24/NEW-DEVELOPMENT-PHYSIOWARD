@@ -4,9 +4,11 @@ import { getCaseStatusFromNotes, mapCaseStatusToDisplay, CaseStatus } from '../u
 import { parseIncidentNotes } from '../utils/notesParser.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { normalizeDate, isDateInRange } from '../utils/dateTime.js'
+import { getTodayDateString } from '../utils/dateUtils.js'
 import { formatUserFullName } from '../utils/userUtils.js'
 import { calculateAge } from '../utils/ageUtils.js'
 import { encodeCursor, decodeCursor, extractCursorDate } from '../utils/cursorPagination.js'
+import { ROLES } from '../constants/roles.js'
 
 // OPTIMIZATION: Constants for active case statuses (avoid recreating array)
 const ACTIVE_CASE_STATUSES = ['new', 'triaged', 'assessed', 'in_rehab'] as const
@@ -15,7 +17,7 @@ const COMPLETED_CASE_STATUSES = ['closed', 'return_to_work'] as const
 const whs = new Hono<{ Variables: AuthVariables }>()
 
 // Get all incidents/cases for WHS (from all supervisors)
-whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.get('/cases', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -81,7 +83,7 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
       .eq('assigned_to_whs', true) // Only show incidents assigned by supervisor
 
     // Filter by status - default to active if not specified
-    const todayStr = new Date().toISOString().split('T')[0]
+    const todayStr = getTodayDateString()
     const filterStatus = status || 'active' // Default to active
     
     if (filterStatus === 'active') {
@@ -468,7 +470,7 @@ whs.get('/cases', authMiddleware, requireRole(['whs_control_center']), async (c)
 })
 
 // Get single case detail by ID for WHS
-whs.get('/cases/:id', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.get('/cases/:id', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -586,6 +588,27 @@ whs.get('/cases/:id', authMiddleware, requireRole(['whs_control_center']), async
       priority = 'LOW'
     }
 
+    // Fetch incident data (photo_url and ai_analysis_result) for this case
+    let incidentPhotoUrl: string | null = null
+    let incidentAiAnalysis: any = null
+    
+    const { data: incidentData } = await adminClient
+      .from('incidents')
+      .select('id, photo_url, ai_analysis_result, incident_date')
+      .eq('user_id', caseData.user_id)
+      .eq('incident_date', caseData.start_date)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    
+    if (incidentData) {
+      // Use proxy URL for incident photo
+      if (incidentData.photo_url) {
+        incidentPhotoUrl = `/api/worker/incident-photo/${incidentData.id}`
+      }
+      incidentAiAnalysis = incidentData.ai_analysis_result || null
+    }
+
     const formattedCase = {
       id: caseData.id,
       caseNumber: generateCaseNumber(caseData.id, caseData.created_at),
@@ -616,6 +639,9 @@ whs.get('/cases/:id', authMiddleware, requireRole(['whs_control_center']), async
       return_to_work_duty_type: caseData.return_to_work_duty_type || null,
       return_to_work_date: caseData.return_to_work_date || null,
       phone: teamMemberResult.data?.phone || null,
+      // Incident data (photo and AI analysis)
+      incidentPhotoUrl,
+      incidentAiAnalysis,
     }
 
     return c.json({ case: formattedCase }, 200, {
@@ -641,7 +667,7 @@ function getSeverity(type: string): string {
 }
 
 // Get notifications for WHS user
-whs.get('/notifications', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.get('/notifications', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -656,7 +682,7 @@ whs.get('/notifications', authMiddleware, requireRole(['whs_control_center']), a
     // SECURITY: Only fetch notifications belonging to the authenticated user
     let query = adminClient
       .from('notifications')
-      .select('*')
+      .select('id, user_id, type, title, message, data, is_read, created_at, read_at')
       .eq('user_id', user.id) // Critical: RLS + explicit user_id check for defense in depth
       .order('created_at', { ascending: false })
       .limit(limit)
@@ -694,7 +720,7 @@ whs.get('/notifications', authMiddleware, requireRole(['whs_control_center']), a
 })
 
 // Mark notification as read
-whs.patch('/notifications/:notificationId/read', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.patch('/notifications/:notificationId/read', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -745,7 +771,7 @@ whs.patch('/notifications/:notificationId/read', authMiddleware, requireRole(['w
 })
 
 // Mark all notifications as read
-whs.patch('/notifications/read-all', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.patch('/notifications/read-all', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -781,7 +807,7 @@ whs.patch('/notifications/read-all', authMiddleware, requireRole(['whs_control_c
 })
 
 // Get all clinicians (for assignment dropdown)
-whs.get('/clinicians', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.get('/clinicians', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -793,7 +819,7 @@ whs.get('/clinicians', authMiddleware, requireRole(['whs_control_center']), asyn
     const { data: clinicians, error } = await adminClient
       .from('users')
       .select('id, email, first_name, last_name, full_name')
-      .eq('role', 'clinician')
+      .eq('role', ROLES.CLINICIAN)
       .order('full_name', { ascending: true, nullsFirst: false })
 
     if (error) {
@@ -818,7 +844,7 @@ whs.get('/clinicians', authMiddleware, requireRole(['whs_control_center']), asyn
 })
 
 // Assign case to clinician
-whs.post('/cases/:caseId/assign-clinician', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.post('/cases/:caseId/assign-clinician', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -844,7 +870,8 @@ whs.post('/cases/:caseId/assign-clinician', authMiddleware, requireRole(['whs_co
           email,
           first_name,
           last_name,
-          full_name
+          full_name,
+          profile_image_url
         ),
         teams!worker_exceptions_team_id_fkey(
           id,
@@ -865,7 +892,7 @@ whs.post('/cases/:caseId/assign-clinician', authMiddleware, requireRole(['whs_co
       .from('users')
       .select('id, email, first_name, last_name, full_name, role')
       .eq('id', clinician_id)
-      .eq('role', 'clinician')
+      .eq('role', ROLES.CLINICIAN)
       .single()
 
     if (clinicianError || !clinician) {
@@ -914,6 +941,7 @@ whs.post('/cases/:caseId/assign-clinician', authMiddleware, requireRole(['whs_co
         worker_id: caseItem.user_id,
         worker_name: workerName,
         worker_email: worker?.email || '',
+        worker_profile_image_url: worker?.profile_image_url || null,
         exception_type: caseItem.exception_type,
         reason: caseItem.reason || '',
         start_date: caseItem.start_date,
@@ -953,7 +981,7 @@ whs.post('/cases/:caseId/assign-clinician', authMiddleware, requireRole(['whs_co
 })
 
 // Get WHS Analytics data
-whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.get('/analytics', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1362,7 +1390,7 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
           .from('users')
           .select('id, email, first_name, last_name, full_name')
           .in('id', supervisorIds)
-          .eq('role', 'supervisor')
+          .eq('role', ROLES.SUPERVISOR)
       : { data: [], error: null }
 
     const supervisorDetailsMap = new Map<string, any>()
@@ -1433,7 +1461,7 @@ whs.get('/analytics', authMiddleware, requireRole(['whs_control_center']), async
 })
 
 // Get Clinician Performance data
-whs.get('/clinicians/performance', authMiddleware, requireRole(['whs_control_center']), async (c) => {
+whs.get('/clinicians/performance', authMiddleware, requireRole([ROLES.WHS_CONTROL_CENTER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1446,7 +1474,7 @@ whs.get('/clinicians/performance', authMiddleware, requireRole(['whs_control_cen
     const { data: clinicians, error: cliniciansError } = await adminClient
       .from('users')
       .select('id, email, first_name, last_name, full_name')
-      .eq('role', 'clinician')
+      .eq('role', ROLES.CLINICIAN)
       .order('full_name', { ascending: true, nullsFirst: false })
 
     if (cliniciansError) {

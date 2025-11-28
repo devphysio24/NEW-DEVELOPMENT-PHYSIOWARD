@@ -4,22 +4,43 @@ import { authMiddleware, requireRole } from '../middleware/auth.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { supabase } from '../lib/supabase.js'
 import { getTodayDateString, getFirstDayOfMonthString, dateToDateString } from '../utils/dateUtils.js'
+import { ROLES, VALID_ROLES } from '../constants/roles.js'
+import { formatUserFullName, getUserInitials } from '../utils/userUtils.js'
+import { getCaseStatusFromNotes } from '../utils/caseStatus.js'
+import { validateEmail, validatePassword } from '../utils/validationUtils.js'
 
 const admin = new Hono()
 
 // Medical incident types that require clinician assignment
 const MEDICAL_INCIDENT_TYPES = ['accident', 'injury', 'medical_leave', 'other'] as const
 
-// Helper function to format clinician full name (reusable across endpoints)
-const formatClinicianName = (clinician: any): string => {
-  return clinician.full_name || 
-         (clinician.first_name && clinician.last_name 
-           ? `${clinician.first_name} ${clinician.last_name}`
-           : clinician.email)
+// Constants for AI cost calculation
+const WHISPER_COST_PER_MINUTE = 0.006 // $0.006 per minute
+const ESTIMATED_ANALYSIS_COST = 0.0015 // Estimated average GPT-3.5-turbo analysis cost
+
+/**
+ * Calculate transcription cost (Whisper + Analysis)
+ * If estimated_cost is stored, use it. Otherwise, estimate from duration.
+ * IMPORTANT: Transcriptions without analysis still have Whisper costs.
+ */
+function calculateTranscriptionCost(transcription: any): number {
+  // Use saved cost if available (including 0, which means it was calculated but is very small)
+  if (transcription.estimated_cost !== null && transcription.estimated_cost !== undefined) {
+    return transcription.estimated_cost
+  }
+  // Fallback: estimate cost from duration
+  const whisperCost = transcription.recording_duration_seconds 
+    ? (transcription.recording_duration_seconds / 60) * WHISPER_COST_PER_MINUTE 
+    : 0
+  // Only add analysis cost if analysis exists
+  const analysisCost = (transcription.analysis !== null && transcription.analysis !== undefined) 
+    ? ESTIMATED_ANALYSIS_COST 
+    : 0
+  return whisperCost + analysisCost
 }
 
 // Get system-wide statistics (admin only)
-admin.get('/stats', authMiddleware, requireRole(['admin']), async (c) => {
+admin.get('/stats', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const adminClient = getAdminClient()
     
@@ -158,32 +179,70 @@ admin.get('/stats', authMiddleware, requireRole(['admin']), async (c) => {
       ? Math.round((todayCheckIns.length / totalWorkers) * 100)
       : 0
 
-    // Get cases statistics
-    const { data: allCases } = await adminClient
-      .from('cases')
-      .select('id, status, is_active, start_date, end_date')
+    // Get cases statistics from worker_exceptions table
+    // Cases are medical-related exceptions assigned to WHS
+    const { data: allCases, error: casesError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, notes, is_active, start_date, end_date, exception_type')
+      .in('exception_type', ['injury', 'medical_leave', 'accident', 'other'])
+      .eq('assigned_to_whs', true)
+
+    if (casesError) {
+      console.error('[GET /admin/stats] Error fetching cases:', casesError)
+    }
 
     const todayDateObj = new Date()
     todayDateObj.setHours(0, 0, 0, 0)
-    const activeCases = allCases?.filter((c: any) => {
-      const start = new Date(c.start_date)
-      start.setHours(0, 0, 0, 0)
-      const end = c.end_date ? new Date(c.end_date) : null
-      if (end) end.setHours(23, 59, 59, 999)
-      return c.is_active && todayDateObj >= start && (!end || todayDateObj <= end)
-    }).length || 0
+    
+    const totalCases = allCases?.length || 0
 
+    // Extract case status from notes field and count by status
     const casesByStatus = {
-      pending: allCases?.filter((c: any) => c.status === 'pending').length || 0,
-      in_progress: allCases?.filter((c: any) => c.status === 'in_progress').length || 0,
-      completed: allCases?.filter((c: any) => c.status === 'completed').length || 0,
-      cancelled: allCases?.filter((c: any) => c.status === 'cancelled').length || 0,
+      pending: 0,
+      in_progress: 0,
+      completed: 0,
+      cancelled: 0,
     }
+
+    allCases?.forEach((c: any) => {
+      const caseStatus = getCaseStatusFromNotes(c.notes)
+      
+      // Map case status to standard status categories
+      // Valid statuses: 'new', 'triaged', 'assessed', 'in_rehab', 'return_to_work', 'closed'
+      if (!caseStatus) {
+        // Default: if no status found, check if active
+        if (c.is_active) {
+          casesByStatus.in_progress++
+        } else {
+          casesByStatus.completed++
+        }
+      } else if (caseStatus === 'new' || caseStatus === 'triaged') {
+        casesByStatus.pending++
+      } else if (caseStatus === 'assessed' || caseStatus === 'in_rehab') {
+        casesByStatus.in_progress++
+      } else if (caseStatus === 'return_to_work' || caseStatus === 'closed') {
+        casesByStatus.completed++
+      } else {
+        // Fallback for any other status
+        if (c.is_active) {
+          casesByStatus.in_progress++
+        } else {
+          casesByStatus.completed++
+        }
+      }
+    })
+
+    // Calculate active cases based on status (pending + in_progress)
+    // This is more accurate than using is_active flag alone
+    const activeCases = casesByStatus.pending + casesByStatus.in_progress
+
+    // Calculate closed cases (completed + cancelled)
+    const closedCases = casesByStatus.completed + casesByStatus.cancelled
 
     // Get incidents statistics
     const { data: allIncidents } = await adminClient
       .from('incidents')
-      .select('id, incident_type, created_at')
+      .select('id, incident_type, created_at, ai_analysis_result, user_id')
 
     const incidents = allIncidents?.filter((i: any) => i.incident_type === 'incident').length || 0
     const nearMisses = allIncidents?.filter((i: any) => i.incident_type === 'near_miss').length || 0
@@ -204,6 +263,247 @@ admin.get('/stats', authMiddleware, requireRole(['admin']), async (c) => {
 
     const completedAppointments = allAppointments?.filter((a: any) => a.status === 'completed').length || 0
     const cancelledAppointments = allAppointments?.filter((a: any) => a.status === 'cancelled').length || 0
+
+    // Get AI usage statistics
+    // 1. Clinician transcriptions (from transcriptions table)
+    // IMPORTANT: Include ALL transcriptions (with or without analysis) because Whisper transcription costs money
+    const { data: allTranscriptions } = await adminClient
+      .from('transcriptions')
+      .select('id, clinician_id, estimated_cost, created_at, analysis, recording_duration_seconds')
+      .gte('created_at', startDate + 'T00:00:00')
+      .lte('created_at', endDate + 'T23:59:59')
+
+    // Separate transcriptions with and without analysis for reporting
+    const transcriptionsWithAnalysis = allTranscriptions?.filter((t: any) => t.analysis !== null && t.analysis !== undefined) || []
+    
+    // Calculate accurate costs for ALL transcriptions (including those without analysis - they still have Whisper costs)
+    const totalTranscriptionCost = (allTranscriptions || []).reduce(
+      (sum: number, t: any) => sum + calculateTranscriptionCost(t),
+      0
+    )
+    
+    // Calculate cost for transcriptions with analysis only (for average calculation)
+    const costForTranscriptionsWithAnalysis = transcriptionsWithAnalysis.reduce(
+      (sum: number, t: any) => sum + calculateTranscriptionCost(t),
+      0
+    )
+    
+    const transcriptionCount = transcriptionsWithAnalysis.length // Count only those with analysis for reporting
+
+    // Calculate daily transcription usage trend
+    const dailyTranscriptionTrend = []
+    for (let i = 0; i <= actualDays; i++) {
+      const date = new Date(start)
+      date.setDate(date.getDate() + i)
+      const dateStr = dateToDateString(date)
+      
+      if (dateStr > endDate) break
+      
+      // Get all transcriptions for this day (with or without analysis - all have Whisper costs)
+      const dayAllTranscriptions = allTranscriptions?.filter((t: any) => {
+        const tDate = new Date(t.created_at)
+        return dateToDateString(tDate) === dateStr
+      }) || []
+      
+      // Count only transcriptions with analysis for the count
+      const dayTranscriptionsWithAnalysis = dayAllTranscriptions.filter((t: any) => t.analysis !== null && t.analysis !== undefined)
+      
+      // Calculate cost for ALL transcriptions (including those without analysis)
+      const dayCost = dayAllTranscriptions.reduce(
+        (sum: number, t: any) => sum + calculateTranscriptionCost(t),
+        0
+      )
+      
+      dailyTranscriptionTrend.push({
+        date: dateStr,
+        count: dayTranscriptionsWithAnalysis.length, // Count only those with analysis
+        cost: dayCost, // But include all costs (Whisper + Analysis)
+        day: date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      })
+    }
+
+    // 2. Worker incident analysis (count incidents that actually used AI analysis)
+    // Only count incidents that have ai_analysis_result (actually used AI)
+    const incidentsInRange = allIncidents?.filter((i: any) => {
+      const incidentDate = new Date(i.created_at)
+      const incidentDateStr = dateToDateString(incidentDate)
+      const inDateRange = incidentDateStr >= startDate && incidentDateStr <= endDate
+      const hasAiAnalysis = i.ai_analysis_result !== null && i.ai_analysis_result !== undefined
+      return inDateRange && hasAiAnalysis
+    }) || []
+    
+    const incidentAnalysisCount = incidentsInRange.length // Only incidents that actually used AI analysis
+    // Estimate cost for incident analysis
+    const estimatedIncidentAnalysisCost = incidentAnalysisCount * ESTIMATED_ANALYSIS_COST
+
+    // 3. Get user usage statistics (who used AI and how much)
+    // Extract unique user IDs from transcriptions and incidents (optimized - single extraction)
+    const clinicianIds = new Set(
+      allTranscriptions?.map((t: any) => t.clinician_id).filter(Boolean) || []
+    )
+    const workerIds = new Set(
+      incidentsInRange.map((i: any) => i.user_id).filter(Boolean)
+    )
+    
+    // Get user details for clinicians who used transcriptions
+    const clinicianUserIds = Array.from(clinicianIds)
+    let clinicianUsers: any[] = []
+    if (clinicianUserIds.length > 0) {
+      const { data: clinicianUsersData } = await adminClient
+        .from('users')
+        .select('id, email, first_name, last_name, full_name, role')
+        .in('id', clinicianUserIds)
+      
+      clinicianUsers = clinicianUsersData || []
+    }
+
+    // Calculate usage per user for transcriptions
+    const userTranscriptionUsage = new Map<string, { count: number; cost: number; user: any }>()
+    allTranscriptions?.forEach((t: any) => {
+      if (!t.clinician_id) return
+      const userId = t.clinician_id
+      const user = clinicianUsers.find(u => u.id === userId) || { id: userId, email: 'Unknown', role: 'clinician' }
+      
+      const usage = userTranscriptionUsage.get(userId) || { count: 0, cost: 0, user }
+      usage.count++
+      usage.cost += calculateTranscriptionCost(t)
+      userTranscriptionUsage.set(userId, usage)
+    })
+
+    // Calculate usage per user for incidents (optimized - no has() check needed)
+    const userIncidentUsage = new Map<string, { count: number; cost: number }>()
+    incidentsInRange.forEach((i: any) => {
+      if (!i.user_id) return
+      const userId = i.user_id
+      const usage = userIncidentUsage.get(userId) || { count: 0, cost: 0 }
+      usage.count++
+      usage.cost += ESTIMATED_ANALYSIS_COST
+      userIncidentUsage.set(userId, usage)
+    })
+
+    // Get user details for workers who used incident analysis (reuse workerIds Set)
+    const workerUserIds = Array.from(workerIds)
+    let workerUsers: any[] = []
+    if (workerUserIds.length > 0) {
+      const { data: workerUsersData } = await adminClient
+        .from('users')
+        .select('id, email, first_name, last_name, full_name, role')
+        .in('id', workerUserIds)
+      
+      workerUsers = workerUsersData || []
+    }
+
+    // Combine user usage data
+    const aiUsageByUser: Array<{
+      userId: string
+      name: string
+      email: string
+      role: string
+      transcriptions: { count: number; cost: number }
+      incidents: { count: number; cost: number }
+      totalCost: number
+      totalRequests: number
+    }> = []
+
+    // Add clinicians who used transcriptions
+    userTranscriptionUsage.forEach((usage, userId) => {
+      const user = usage.user
+      const name = formatUserFullName(user) || user.email || 'Unknown'
+      
+      aiUsageByUser.push({
+        userId,
+        name,
+        email: user.email || 'Unknown',
+        role: user.role || 'clinician',
+        transcriptions: {
+          count: usage.count,
+          cost: usage.cost
+        },
+        incidents: {
+          count: 0,
+          cost: 0
+        },
+        totalCost: usage.cost,
+        totalRequests: usage.count
+      })
+    })
+
+    // Add workers who used incident analysis
+    userIncidentUsage.forEach((usage, userId) => {
+      const existingUser = aiUsageByUser.find(u => u.userId === userId)
+      const workerUser = workerUsers.find(u => u.id === userId)
+      const name = workerUser ? formatUserFullName(workerUser) : 'Unknown'
+
+      if (existingUser) {
+        // User already exists (clinician who also reported incidents)
+        existingUser.incidents = {
+          count: usage.count,
+          cost: usage.cost
+        }
+        existingUser.totalCost += usage.cost
+        existingUser.totalRequests += usage.count
+      } else {
+        // New user (worker only)
+        aiUsageByUser.push({
+          userId,
+          name,
+          email: workerUser?.email || 'Unknown',
+          role: workerUser?.role || 'worker',
+          transcriptions: {
+            count: 0,
+            cost: 0
+          },
+          incidents: {
+            count: usage.count,
+            cost: usage.cost
+          },
+          totalCost: usage.cost,
+          totalRequests: usage.count
+        })
+      }
+    })
+
+    // Sort by total cost (descending)
+    aiUsageByUser.sort((a, b) => b.totalCost - a.totalCost)
+
+    // Calculate daily incident analysis trend
+    const dailyIncidentAnalysisTrend = []
+    for (let i = 0; i <= actualDays; i++) {
+      const date = new Date(start)
+      date.setDate(date.getDate() + i)
+      const dateStr = dateToDateString(date)
+      
+      if (dateStr > endDate) break
+      
+      const dayIncidents = incidentsInRange.filter((i: any) => {
+        const iDate = new Date(i.created_at)
+        return dateToDateString(iDate) === dateStr
+      })
+      
+      dailyIncidentAnalysisTrend.push({
+        date: dateStr,
+        count: dayIncidents.length,
+        day: date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      })
+    }
+
+    // Calculate total AI usage
+    const totalAIUsage = {
+      transcriptions: {
+        count: transcriptionCount,
+        totalCost: totalTranscriptionCost, // Total cost of ALL transcriptions (with and without analysis)
+        averageCost: transcriptionCount > 0 ? costForTranscriptionsWithAnalysis / transcriptionCount : 0, // Average cost per transcription WITH analysis
+        dailyTrend: dailyTranscriptionTrend,
+      },
+      incidentAnalysis: {
+        count: incidentAnalysisCount,
+        estimatedCost: estimatedIncidentAnalysisCost,
+        dailyTrend: dailyIncidentAnalysisTrend,
+      },
+      totalCost: totalTranscriptionCost + estimatedIncidentAnalysisCost, // Transcription + incident analysis costs
+      totalRequests: transcriptionCount + incidentAnalysisCount,
+      users: aiUsageByUser, // List of users who used AI
+    }
 
     return c.json({
       users: {
@@ -229,9 +529,9 @@ admin.get('/stats', authMiddleware, requireRole(['admin']), async (c) => {
         dailyTrend: dailyCheckInsTrend,
       },
       cases: {
-        total: allCases?.length || 0,
+        total: totalCases,
         active: activeCases,
-        closed: allCases?.filter((c: any) => !c.is_active).length || 0,
+        closed: closedCases,
         byStatus: casesByStatus,
       },
       incidents: {
@@ -246,6 +546,7 @@ admin.get('/stats', authMiddleware, requireRole(['admin']), async (c) => {
         completed: completedAppointments,
         cancelled: cancelledAppointments,
       },
+      aiUsage: totalAIUsage,
     }, 200, {
       'Cache-Control': 'no-store, no-cache, must-revalidate',
     })
@@ -256,7 +557,7 @@ admin.get('/stats', authMiddleware, requireRole(['admin']), async (c) => {
 })
 
 // Create user account (admin only - can create any role)
-admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
+admin.post('/users', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const { email, password, role, first_name, last_name, business_name, business_registration_number, gender, date_of_birth } = await c.req.json()
 
@@ -308,13 +609,13 @@ admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
     }
 
     // Validate role
-    const validRoles = ['worker', 'supervisor', 'whs_control_center', 'executive', 'clinician', 'team_leader', 'admin']
+    const validRoles = VALID_ROLES
     if (!role || !validRoles.includes(role)) {
       return c.json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` }, 400)
     }
 
     // Supervisor-specific validation
-    if (role === 'supervisor') {
+    if (role === ROLES.SUPERVISOR) {
       if (!business_name || typeof business_name !== 'string' || !business_name.trim()) {
         return c.json({ error: 'Business Name is required for supervisors' }, 400)
       }
@@ -323,14 +624,16 @@ admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
       }
     }
 
-    if (password.length < 6) {
-      return c.json({ error: 'Password must be at least 6 characters' }, 400)
+    // Validate password
+    const passwordValidation = validatePassword(password)
+    if (!passwordValidation.valid) {
+      return c.json({ error: passwordValidation.error }, 400)
     }
 
     // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-    if (!emailRegex.test(trimmedEmail)) {
-      return c.json({ error: 'Invalid email format' }, 400)
+    const emailValidation = validateEmail(trimmedEmail)
+    if (!emailValidation.valid) {
+      return c.json({ error: emailValidation.error }, 400)
     }
 
     const adminClient = getAdminClient()
@@ -392,7 +695,7 @@ admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
     }
 
     // Add business fields for supervisors
-    if (role === 'supervisor') {
+    if (role === ROLES.SUPERVISOR) {
       userInsertData.business_name = business_name.trim()
       userInsertData.business_registration_number = business_registration_number.trim()
     }
@@ -430,7 +733,7 @@ admin.post('/users', authMiddleware, requireRole(['admin']), async (c) => {
 })
 
 // Get all users with pagination, search, and filtering (admin only)
-admin.get('/users', authMiddleware, requireRole(['admin']), async (c) => {
+admin.get('/users', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const page = parseInt(c.req.query('page') || '1')
     const limit = Math.min(parseInt(c.req.query('limit') || '20'), 100)
@@ -515,7 +818,7 @@ admin.get('/users', authMiddleware, requireRole(['admin']), async (c) => {
 })
 
 // Get single user by ID (admin only)
-admin.get('/users/:id', authMiddleware, requireRole(['admin']), async (c) => {
+admin.get('/users/:id', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const userId = c.req.param('id')
     const adminClient = getAdminClient()
@@ -542,7 +845,7 @@ admin.get('/users/:id', authMiddleware, requireRole(['admin']), async (c) => {
 })
 
 // Update user (admin only)
-admin.patch('/users/:id', authMiddleware, requireRole(['admin']), async (c) => {
+admin.patch('/users/:id', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const userId = c.req.param('id')
     const { email, role, first_name, last_name, business_name, business_registration_number } = await c.req.json()
@@ -554,7 +857,7 @@ admin.patch('/users/:id', authMiddleware, requireRole(['admin']), async (c) => {
     const updateData: any = {}
     if (email !== undefined) updateData.email = email.trim().toLowerCase()
     if (role !== undefined) {
-      const validRoles = ['worker', 'supervisor', 'whs_control_center', 'executive', 'clinician', 'team_leader', 'admin']
+      const validRoles = VALID_ROLES
       if (!validRoles.includes(role)) {
         return c.json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` }, 400)
       }
@@ -609,7 +912,7 @@ admin.patch('/users/:id', authMiddleware, requireRole(['admin']), async (c) => {
 })
 
 // Delete user (admin only)
-admin.delete('/users/:id', authMiddleware, requireRole(['admin']), async (c) => {
+admin.delete('/users/:id', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const userId = c.req.param('id')
     const adminClient = getAdminClient()
@@ -651,7 +954,7 @@ admin.delete('/users/:id', authMiddleware, requireRole(['admin']), async (c) => 
 })
 
 // Get all supervisors with team and worker statistics (admin only)
-admin.get('/supervisors', authMiddleware, requireRole(['admin']), async (c) => {
+admin.get('/supervisors', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const adminClient = getAdminClient()
 
@@ -659,7 +962,7 @@ admin.get('/supervisors', authMiddleware, requireRole(['admin']), async (c) => {
     const { data: supervisors, error: supervisorsError } = await adminClient
       .from('users')
       .select('id, email, first_name, last_name, full_name, business_name, business_registration_number')
-      .eq('role', 'supervisor')
+      .eq('role', ROLES.SUPERVISOR)
 
     if (supervisorsError) {
       console.error('[GET /admin/supervisors] Error fetching supervisors:', supervisorsError)
@@ -759,7 +1062,7 @@ admin.get('/supervisors', authMiddleware, requireRole(['admin']), async (c) => {
 })
 
 // Get supervisor details with team leaders and their members (admin only)
-admin.get('/supervisors/:id', authMiddleware, requireRole(['admin']), async (c) => {
+admin.get('/supervisors/:id', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const adminClient = getAdminClient()
     const supervisorId = c.req.param('id')
@@ -769,7 +1072,7 @@ admin.get('/supervisors/:id', authMiddleware, requireRole(['admin']), async (c) 
       .from('users')
       .select('id, email, first_name, last_name, full_name, business_name, business_registration_number')
       .eq('id', supervisorId)
-      .eq('role', 'supervisor')
+      .eq('role', ROLES.SUPERVISOR)
       .single()
 
     if (supervisorError || !supervisor) {
@@ -920,15 +1223,32 @@ admin.get('/supervisors/:id', authMiddleware, requireRole(['admin']), async (c) 
 })
 
 // Get all clinicians with statistics (admin only)
-admin.get('/clinicians', authMiddleware, requireRole(['admin']), async (c) => {
+admin.get('/clinicians', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const adminClient = getAdminClient()
 
-    // Get all clinicians
+    // Get pagination parameters
+    const page = parseInt(c.req.query('page') || '1', 10)
+    const limit = parseInt(c.req.query('limit') || '20', 10)
+    const offset = (page - 1) * limit
+
+    // Get total count first
+    const { count: totalCount, error: countError } = await adminClient
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .eq('role', ROLES.CLINICIAN)
+
+    if (countError) {
+      console.error('[GET /admin/clinicians] Error counting clinicians:', countError)
+    }
+
+    // Get paginated clinicians
     const { data: clinicians, error: cliniciansError } = await adminClient
       .from('users')
       .select('id, email, first_name, last_name, full_name')
-      .eq('role', 'clinician')
+      .eq('role', ROLES.CLINICIAN)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1)
 
     if (cliniciansError) {
       console.error('[GET /admin/clinicians] Error fetching clinicians:', cliniciansError)
@@ -1062,7 +1382,7 @@ admin.get('/clinicians', authMiddleware, requireRole(['admin']), async (c) => {
         email: clinician.email,
         first_name: clinician.first_name,
         last_name: clinician.last_name,
-        full_name: formatClinicianName(clinician),
+        full_name: formatUserFullName(clinician),
         active_cases: stats.activeCases,
         total_cases: stats.totalCases,
         upcoming_appointments: stats.upcomingAppointments,
@@ -1072,7 +1392,19 @@ admin.get('/clinicians', authMiddleware, requireRole(['admin']), async (c) => {
       }
     })
 
-    return c.json({ clinicians: cliniciansWithStats })
+    const totalPages = Math.ceil((totalCount || 0) / limit)
+
+    return c.json({ 
+      clinicians: cliniciansWithStats,
+      pagination: {
+        page,
+        limit,
+        total: totalCount || 0,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1
+      }
+    })
   } catch (error: any) {
     console.error('[GET /admin/clinicians] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
@@ -1080,7 +1412,7 @@ admin.get('/clinicians', authMiddleware, requireRole(['admin']), async (c) => {
 })
 
 // Get clinician details with cases, appointments, and rehabilitation plans (admin only)
-admin.get('/clinicians/:id', authMiddleware, requireRole(['admin']), async (c) => {
+admin.get('/clinicians/:id', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const adminClient = getAdminClient()
     const clinicianId = c.req.param('id')
@@ -1090,18 +1422,45 @@ admin.get('/clinicians/:id', authMiddleware, requireRole(['admin']), async (c) =
       .from('users')
       .select('id, email, first_name, last_name, full_name')
       .eq('id', clinicianId)
-      .eq('role', 'clinician')
+      .eq('role', ROLES.CLINICIAN)
       .single()
 
     if (clinicianError || !clinician) {
       return c.json({ error: 'Clinician not found' }, 404)
     }
 
+    // Get pagination parameters for detail sections
+    const casesPage = parseInt(c.req.query('casesPage') || '1', 10)
+    const casesLimit = parseInt(c.req.query('casesLimit') || '10', 10)
+    const casesOffset = (casesPage - 1) * casesLimit
+
+    const appointmentsPage = parseInt(c.req.query('appointmentsPage') || '1', 10)
+    const appointmentsLimit = parseInt(c.req.query('appointmentsLimit') || '10', 10)
+    const appointmentsOffset = (appointmentsPage - 1) * appointmentsLimit
+
+    const rehabPlansPage = parseInt(c.req.query('rehabPlansPage') || '1', 10)
+    const rehabPlansLimit = parseInt(c.req.query('rehabPlansLimit') || '10', 10)
+    const rehabPlansOffset = (rehabPlansPage - 1) * rehabPlansLimit
+
+    // Get counts first
+    const [casesCountResult, appointmentsCountResult, rehabPlansCountResult] = await Promise.all([
+      adminClient
+        .from('worker_exceptions')
+        .select('*', { count: 'exact', head: true })
+        .in('exception_type', MEDICAL_INCIDENT_TYPES)
+        .not('clinician_id', 'is', null)
+        .eq('clinician_id', clinicianId),
+      adminClient
+        .from('appointments')
+        .select('*', { count: 'exact', head: true })
+        .eq('clinician_id', clinicianId),
+      adminClient
+        .from('rehabilitation_plans')
+        .select('*', { count: 'exact', head: true })
+        .eq('clinician_id', clinicianId),
+    ])
+
     // OPTIMIZATION: Fetch all data in parallel
-    // Only show exception types that are considered "incidents":
-    // - accident, injury, medical_leave, other (exclude 'transfer' as it's administrative, not an incident)
-    const incidentTypes = ['accident', 'injury', 'medical_leave', 'other']
-    
     const [casesResult, appointmentsResult, rehabPlansResult] = await Promise.all([
       adminClient
         .from('worker_exceptions')
@@ -1126,10 +1485,11 @@ admin.get('/clinicians/:id', authMiddleware, requireRole(['admin']), async (c) =
             site_location
           )
         `)
-        .in('exception_type', incidentTypes)
+        .in('exception_type', MEDICAL_INCIDENT_TYPES)
         .not('clinician_id', 'is', null)
         .eq('clinician_id', clinicianId)
-        .order('created_at', { ascending: false }),
+        .order('created_at', { ascending: false })
+        .range(casesOffset, casesOffset + casesLimit - 1),
       adminClient
         .from('appointments')
         .select(`
@@ -1157,7 +1517,8 @@ admin.get('/clinicians/:id', authMiddleware, requireRole(['admin']), async (c) =
         `)
         .eq('clinician_id', clinicianId)
         .order('appointment_date', { ascending: false })
-        .order('appointment_time', { ascending: false }),
+        .order('appointment_time', { ascending: false })
+        .range(appointmentsOffset, appointmentsOffset + appointmentsLimit - 1),
       adminClient
         .from('rehabilitation_plans')
         .select(`
@@ -1182,7 +1543,8 @@ admin.get('/clinicians/:id', authMiddleware, requireRole(['admin']), async (c) =
           )
         `)
         .eq('clinician_id', clinicianId)
-        .order('created_at', { ascending: false }),
+        .order('created_at', { ascending: false })
+        .range(rehabPlansOffset, rehabPlansOffset + rehabPlansLimit - 1),
     ])
 
     const { data: cases, error: casesError } = casesResult
@@ -1199,20 +1561,553 @@ admin.get('/clinicians/:id', authMiddleware, requireRole(['admin']), async (c) =
       console.error('[GET /admin/clinicians/:id] Error fetching rehabilitation plans:', rehabPlansError)
     }
 
+    const casesCount = casesCountResult?.count || 0
+    const appointmentsCount = appointmentsCountResult?.count || 0
+    const rehabPlansCount = rehabPlansCountResult?.count || 0
+
     return c.json({
       clinician: {
         id: clinician.id,
         email: clinician.email,
         first_name: clinician.first_name,
         last_name: clinician.last_name,
-        full_name: formatClinicianName(clinician),
+        full_name: formatUserFullName(clinician),
       },
       cases: cases || [],
+      casesPagination: {
+        page: casesPage,
+        limit: casesLimit,
+        total: casesCount,
+        totalPages: Math.ceil(casesCount / casesLimit),
+        hasNext: casesPage < Math.ceil(casesCount / casesLimit),
+        hasPrev: casesPage > 1
+      },
       appointments: appointments || [],
+      appointmentsPagination: {
+        page: appointmentsPage,
+        limit: appointmentsLimit,
+        total: appointmentsCount,
+        totalPages: Math.ceil(appointmentsCount / appointmentsLimit),
+        hasNext: appointmentsPage < Math.ceil(appointmentsCount / appointmentsLimit),
+        hasPrev: appointmentsPage > 1
+      },
       rehabilitation_plans: rehabPlans || [],
+      rehabPlansPagination: {
+        page: rehabPlansPage,
+        limit: rehabPlansLimit,
+        total: rehabPlansCount,
+        totalPages: Math.ceil(rehabPlansCount / rehabPlansLimit),
+        hasNext: rehabPlansPage < Math.ceil(rehabPlansCount / rehabPlansLimit),
+        hasPrev: rehabPlansPage > 1
+      },
     })
   } catch (error: any) {
     console.error('[GET /admin/clinicians/:id] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get all clinician cases (admin view) - NEW ENDPOINT FOR ADMIN
+admin.get('/clinician-cases', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
+  try {
+    const page = c.req.query('page') ? parseInt(c.req.query('page')!) : 1
+    const limit = Math.min(parseInt(c.req.query('limit') || '100'), 200)
+    const status = c.req.query('status') || 'all'
+    const search = c.req.query('search') || ''
+
+    const adminClient = getAdminClient()
+    const offset = (page - 1) * limit
+
+    // Get all medical-related exceptions (admin can see all cases)
+    let query = adminClient
+      .from('worker_exceptions')
+      .select(`
+        *,
+        users!worker_exceptions_user_id_fkey(
+          id,
+          email,
+          first_name,
+          last_name,
+          full_name,
+          profile_image_url
+        ),
+        teams!worker_exceptions_team_id_fkey(
+          id,
+          name,
+          site_location,
+          supervisor_id,
+          team_leader_id
+        )
+      `)
+      .in('exception_type', ['injury', 'medical_leave', 'accident', 'other'])
+      .eq('assigned_to_whs', true) // Only cases that were assigned to WHS
+
+    // Filter by status
+    const todayStr = getTodayDateString()
+    if (status === 'active') {
+      query = query.eq('is_active', true)
+    }
+
+    // Count query
+    const countQuery = adminClient
+      .from('worker_exceptions')
+      .select('*', { count: 'exact', head: true })
+      .in('exception_type', ['injury', 'medical_leave', 'accident', 'other'])
+      .eq('assigned_to_whs', true)
+    
+    if (status === 'active') {
+      countQuery.eq('is_active', true)
+    }
+
+    // Get total count and cases in parallel
+    const [countResult, casesResult] = await Promise.all([
+      countQuery,
+      query
+        .order('created_at', { ascending: false })
+        .range(offset, offset + limit - 1)
+    ])
+
+    const { count } = countResult
+    const { data: cases, error: casesError } = casesResult
+
+    if (casesError) {
+      console.error('[GET /admin/clinician-cases] Database Error:', casesError)
+      return c.json({ error: 'Failed to fetch cases', details: casesError.message }, 500)
+    }
+
+    // Get rehabilitation plans for cases
+    const caseIds = (cases || []).map((c: any) => c.id)
+    const caseUserIds = (cases || []).map((c: any) => c.user_id).filter(Boolean)
+    const caseTeamIds = (cases || []).map((c: any) => c.team_id).filter(Boolean)
+    
+    let rehabPlans: any[] = []
+    if (caseIds.length > 0) {
+      const { data: rehabPlansData } = await adminClient
+        .from('rehabilitation_plans')
+        .select('exception_id, status')
+        .in('exception_id', caseIds)
+        .eq('status', 'active')
+      
+      rehabPlans = rehabPlansData || []
+    }
+
+    const rehabMap = new Map()
+    rehabPlans.forEach((plan: any) => {
+      rehabMap.set(plan.exception_id, true)
+    })
+
+    // Batch fetch phone numbers
+    let phoneMap = new Map<string, string>()
+    if (caseUserIds.length > 0 && caseTeamIds.length > 0) {
+      const { data: teamMembers } = await adminClient
+        .from('team_members')
+        .select('user_id, team_id, phone')
+        .in('user_id', caseUserIds)
+        .in('team_id', caseTeamIds)
+      
+      if (teamMembers) {
+        teamMembers.forEach((member: any) => {
+          const key = `${member.user_id}_${member.team_id}`
+          if (member.phone) {
+            phoneMap.set(key, member.phone)
+          }
+        })
+      }
+    }
+
+    // Get supervisor and team leader info
+    const supervisorIds = Array.from(new Set(
+      (cases || [])
+        .map((incident: any) => {
+          const team = Array.isArray(incident.teams) ? incident.teams[0] : incident.teams
+          return team?.supervisor_id
+        })
+        .filter(Boolean)
+    ))
+
+    const teamLeaderIds = Array.from(new Set(
+      (cases || [])
+        .map((incident: any) => {
+          const team = Array.isArray(incident.teams) ? incident.teams[0] : incident.teams
+          return team?.team_leader_id
+        })
+        .filter(Boolean)
+    ))
+
+    // Get clinician IDs from cases
+    const clinicianIds = Array.from(new Set(
+      (cases || [])
+        .map((incident: any) => incident.clinician_id)
+        .filter(Boolean)
+    ))
+
+    const allUserIds = Array.from(new Set([...supervisorIds, ...teamLeaderIds, ...clinicianIds]))
+    let userMap = new Map()
+    if (allUserIds.length > 0) {
+      const { data: users } = await adminClient
+        .from('users')
+        .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
+        .in('id', allUserIds)
+
+      if (users) {
+        users.forEach((userData: any) => {
+          userMap.set(userData.id, userData)
+        })
+      }
+    }
+
+    // Format cases
+    const todayDate = new Date()
+    todayDate.setHours(0, 0, 0, 0)
+    const casesArray = Array.isArray(cases) ? cases : []
+    
+    // Helper function to generate case number
+    const generateCaseNumber = (exceptionId: string, createdAt: string): string => {
+      const date = new Date(createdAt)
+      const year = date.getFullYear()
+      const month = String(date.getMonth() + 1).padStart(2, '0')
+      const day = String(date.getDate()).padStart(2, '0')
+      const hours = String(date.getHours()).padStart(2, '0')
+      const minutes = String(date.getMinutes()).padStart(2, '0')
+      const seconds = String(date.getSeconds()).padStart(2, '0')
+      const uuidPrefix = exceptionId?.substring(0, 4)?.toUpperCase() || 'CASE'
+      return `CASE-${year}${month}${day}-${hours}${minutes}${seconds}-${uuidPrefix}`
+    }
+
+    // Use centralized utility functions from userUtils
+
+    let formattedCases = casesArray.map((incident: any) => {
+      const user = incident.users?.[0] || incident.users
+      const team = incident.teams?.[0] || incident.teams
+      const supervisor = team?.supervisor_id ? userMap.get(team.supervisor_id) : null
+      const teamLeader = team?.team_leader_id ? userMap.get(team.team_leader_id) : null
+      const clinician = incident.clinician_id ? userMap.get(incident.clinician_id) : null
+      
+      const phoneKey = `${incident.user_id}_${incident.team_id}`
+      const phone = phoneMap.get(phoneKey) || null
+
+      const startDate = new Date(incident.start_date)
+      startDate.setHours(0, 0, 0, 0)
+      const endDate = incident.end_date ? new Date(incident.end_date) : null
+      if (endDate) endDate.setHours(0, 0, 0, 0)
+      
+      const isCurrentlyActive = todayDate >= startDate && (!endDate || todayDate <= endDate) && incident.is_active
+      const isInRehab = rehabMap.has(incident.id)
+
+      const workerName = user ? formatUserFullName(user) : 'Unknown'
+      
+      // Determine current status
+      let currentStatus = 'NEW CASE'
+      if (!incident.is_active) {
+        currentStatus = 'CLOSED'
+      } else if (isInRehab) {
+        currentStatus = 'IN REHAB'
+      } else if (isCurrentlyActive) {
+        currentStatus = 'ACTIVE'
+      }
+
+      return {
+        id: incident.id,
+        caseNumber: generateCaseNumber(incident.id, incident.created_at),
+        workerId: user?.id || incident.user_id,
+        workerName,
+        workerEmail: user?.email || '',
+        workerInitials: getUserInitials(workerName),
+        workerProfileImageUrl: user?.profile_image_url || null,
+        teamId: team?.id || incident.team_id,
+        teamName: team?.name || 'Unknown Team',
+        siteLocation: team?.site_location || '',
+        supervisorId: supervisor?.id || null,
+        supervisorName: supervisor ? formatUserFullName(supervisor) : 'Unknown',
+        teamLeaderId: teamLeader?.id || null,
+        teamLeaderName: teamLeader ? formatUserFullName(teamLeader) : 'Unknown',
+        clinicianId: clinician?.id || null,
+        clinicianName: clinician ? formatUserFullName(clinician) : 'Unknown',
+        clinicianEmail: clinician?.email || null,
+        type: incident.exception_type,
+        reason: incident.reason || '',
+        startDate: incident.start_date,
+        endDate: incident.end_date,
+        status: currentStatus,
+        priority: incident.priority || 'MEDIUM',
+        isActive: isCurrentlyActive,
+        isInRehab,
+        createdAt: incident.created_at,
+        updatedAt: incident.updated_at,
+        phone,
+      }
+    })
+
+    // Apply search filter if provided
+    if (search.trim()) {
+      const searchLower = search.toLowerCase().trim()
+      formattedCases = formattedCases.filter((c: any) => 
+        c.workerName.toLowerCase().includes(searchLower) ||
+        c.workerEmail.toLowerCase().includes(searchLower) ||
+        c.teamName.toLowerCase().includes(searchLower) ||
+        c.siteLocation.toLowerCase().includes(searchLower) ||
+        (c.phone && c.phone.includes(searchLower)) ||
+        c.caseNumber.toLowerCase().includes(searchLower)
+      )
+    }
+
+    const total = count || 0
+    const totalPages = Math.ceil(total / limit)
+
+    return c.json({
+      cases: formattedCases,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1,
+      },
+    })
+  } catch (error: any) {
+    console.error('[GET /admin/clinician-cases] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Get single clinician case detail (admin view - read-only)
+admin.get('/clinician-cases/:id', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
+  try {
+    const caseId = c.req.param('id')
+    if (!caseId) {
+      return c.json({ error: 'Case ID is required' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // Get single case with related data
+    const { data: caseData, error: caseError } = await adminClient
+      .from('worker_exceptions')
+      .select(`
+        *,
+        users!worker_exceptions_user_id_fkey(
+          id,
+          email,
+          first_name,
+          last_name,
+          full_name,
+          gender,
+          date_of_birth
+        ),
+        teams!worker_exceptions_team_id_fkey(
+          id,
+          name,
+          site_location,
+          supervisor_id,
+          team_leader_id
+        )
+      `)
+      .eq('id', caseId)
+      .eq('assigned_to_whs', true)
+      .in('exception_type', ['injury', 'medical_leave', 'accident', 'other'])
+      .single()
+
+    if (caseError || !caseData) {
+      console.error('[GET /admin/clinician-cases/:id] Error:', caseError)
+      return c.json({ error: 'Case not found' }, 404)
+    }
+
+    // Parallel fetch of related data
+    const team = Array.isArray(caseData.teams) ? caseData.teams[0] : caseData.teams
+    const userIds = [team?.supervisor_id, team?.team_leader_id, caseData.clinician_id].filter(Boolean)
+    
+    const [teamMemberResult, usersResult, rehabPlanResult, incidentResult] = await Promise.all([
+      // Get phone number
+      adminClient
+        .from('team_members')
+        .select('phone')
+        .eq('user_id', caseData.user_id)
+        .eq('team_id', caseData.team_id)
+        .maybeSingle(),
+      
+      // Get supervisor, team leader, and clinician info
+      userIds.length > 0
+        ? adminClient
+            .from('users')
+            .select('id, email, first_name, last_name, full_name, gender, date_of_birth')
+            .in('id', userIds)
+        : Promise.resolve({ data: [] }),
+      
+      // Check rehab status
+      adminClient
+        .from('rehabilitation_plans')
+        .select('id, status, clinician_id')
+        .eq('exception_id', caseId)
+        .eq('status', 'active')
+        .maybeSingle(),
+      
+      // Get incident photo and AI analysis
+      adminClient
+        .from('incidents')
+        .select('id, photo_url, ai_analysis_result, incident_date')
+        .eq('user_id', caseData.user_id)
+        .eq('incident_date', caseData.start_date)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+    ])
+
+    // Build user map
+    const userMap = new Map()
+    if (usersResult.data) {
+      usersResult.data.forEach((u: any) => userMap.set(u.id, u))
+    }
+
+    const user_data = Array.isArray(caseData.users) ? caseData.users[0] : caseData.users
+    const supervisor = userMap.get(team?.supervisor_id)
+    const teamLeader = userMap.get(team?.team_leader_id)
+    const clinician = userMap.get(caseData.clinician_id)
+    
+    // Calculate age if DOB available
+    let age = null
+    if (user_data?.date_of_birth) {
+      try {
+        const dob = new Date(user_data.date_of_birth)
+        const today = new Date()
+        age = today.getFullYear() - dob.getFullYear()
+        const monthDiff = today.getMonth() - dob.getMonth()
+        if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < dob.getDate())) {
+          age--
+        }
+      } catch (e) {
+        console.error('Error calculating age:', e)
+      }
+    }
+
+    // Parse notes
+    const parsedNotes = caseData.notes ? {
+      incidentDate: '',
+      incidentTime: '',
+      location: '',
+      description: '',
+      injuryType: '',
+      bodyPart: '',
+      severity: '',
+      witnessName: '',
+      witnessContact: '',
+      firstAid: '',
+      reportedBy: '',
+      reportedDate: ''
+    } : null
+
+    if (caseData.notes) {
+      const lines = caseData.notes.split('\n')
+      lines.forEach((line: string) => {
+        const [key, ...valueParts] = line.split(':')
+        const value = valueParts.join(':').trim()
+        
+        if (key.includes('Incident Date')) parsedNotes!.incidentDate = value
+        else if (key.includes('Incident Time')) parsedNotes!.incidentTime = value
+        else if (key.includes('Location')) parsedNotes!.location = value
+        else if (key.includes('Description')) parsedNotes!.description = value
+        else if (key.includes('Injury Type')) parsedNotes!.injuryType = value
+        else if (key.includes('Body Part')) parsedNotes!.bodyPart = value
+        else if (key.includes('Severity')) parsedNotes!.severity = value
+        else if (key.includes('Witness Name')) parsedNotes!.witnessName = value
+        else if (key.includes('Witness Contact')) parsedNotes!.witnessContact = value
+        else if (key.includes('First Aid')) parsedNotes!.firstAid = value
+        else if (key.includes('Reported By')) parsedNotes!.reportedBy = value
+        else if (key.includes('Reported Date')) parsedNotes!.reportedDate = value
+      })
+    }
+
+    // Determine case status
+    const isInRehab = !!rehabPlanResult.data
+    const todayDate = new Date()
+    todayDate.setHours(0, 0, 0, 0)
+    const startDate = new Date(caseData.start_date)
+    startDate.setHours(0, 0, 0, 0)
+    const endDate = caseData.end_date ? new Date(caseData.end_date) : null
+    if (endDate) endDate.setHours(0, 0, 0, 0)
+    const isCurrentlyActive = todayDate >= startDate && (!endDate || todayDate <= endDate) && caseData.is_active
+
+    let currentStatus = 'NEW CASE'
+    if (!caseData.is_active) {
+      currentStatus = 'CLOSED'
+    } else if (isInRehab) {
+      currentStatus = 'IN REHAB'
+    } else if (isCurrentlyActive) {
+      currentStatus = 'ACTIVE'
+    }
+
+    // Format helper
+    const formatName = (user: any): string => {
+      if (!user) return ''
+      if (user.full_name) return user.full_name
+      if (user.first_name && user.last_name) return `${user.first_name} ${user.last_name}`
+      return user.email || ''
+    }
+
+    // Generate case number
+    const generateCaseNumber = (exceptionId: string, createdAt: string): string => {
+      const date = new Date(createdAt)
+      const year = date.getFullYear()
+      const month = String(date.getMonth() + 1).padStart(2, '0')
+      const day = String(date.getDate()).padStart(2, '0')
+      const hours = String(date.getHours()).padStart(2, '0')
+      const minutes = String(date.getMinutes()).padStart(2, '0')
+      const seconds = String(date.getSeconds()).padStart(2, '0')
+      const uuidPrefix = exceptionId?.substring(0, 4)?.toUpperCase() || 'CASE'
+      return `CASE-${year}${month}${day}-${hours}${minutes}${seconds}-${uuidPrefix}`
+    }
+
+    // Process incident photo URL (convert to proxy URL)
+    let incidentPhotoUrl = null
+    if (incidentResult.data?.photo_url && incidentResult.data?.id) {
+      incidentPhotoUrl = `/api/worker/incident-photo/${incidentResult.data.id}`
+    }
+
+    return c.json({
+      id: caseData.id,
+      caseNumber: generateCaseNumber(caseData.id, caseData.created_at),
+      status: currentStatus,
+      priority: caseData.priority || 'MEDIUM',
+      createdAt: caseData.created_at,
+      worker: {
+        id: user_data?.id || caseData.user_id,
+        name: formatName(user_data),
+        email: user_data?.email || '',
+        phone: teamMemberResult.data?.phone || '',
+        role: 'Worker',
+        initials: formatName(user_data).split(' ').map((n: string) => n[0]).join('').toUpperCase().slice(0, 2) || '??',
+        gender: user_data?.gender || null,
+        age: age,
+      },
+      team: {
+        teamName: team?.name || '',
+        teamLeaderName: formatName(teamLeader),
+        supervisorName: formatName(supervisor),
+        siteLocation: team?.site_location || '',
+        clinician: clinician ? {
+          name: formatName(clinician),
+          email: clinician.email || '',
+        } : undefined,
+      },
+      incident: {
+        number: generateCaseNumber(caseData.id, caseData.created_at),
+        date: parsedNotes?.incidentDate || caseData.start_date,
+        type: caseData.exception_type,
+        severity: parsedNotes?.severity || 'Unknown',
+        description: parsedNotes?.description || caseData.reason || '',
+        photoUrl: incidentPhotoUrl,
+        aiAnalysis: incidentResult.data?.ai_analysis_result || null,
+      },
+      caseStatus: currentStatus.toLowerCase().replace(' ', '_') as any,
+      approvedBy: caseData.approved_by || undefined,
+      approvedAt: caseData.approved_at || undefined,
+      returnToWorkDutyType: caseData.return_to_work_duty_type || undefined,
+      returnToWorkDate: caseData.return_to_work_date || undefined,
+      clinicalNotes: caseData.clinical_notes || undefined,
+      clinicalNotesUpdatedAt: caseData.clinical_notes_updated_at || undefined,
+    })
+  } catch (error: any) {
+    console.error('[GET /admin/clinician-cases/:id] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
   }
 })

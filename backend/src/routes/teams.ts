@@ -8,13 +8,15 @@ import { formatDateString } from '../utils/dateTime.js'
 // Import optimized utility functions
 import { getTodayDateString, getTodayDate } from '../utils/dateUtils.js'
 import { isExceptionActive } from '../utils/exceptionUtils.js'
+import { ROLES } from '../constants/roles.js'
 import { formatTeamLeader, formatUserFullName } from '../utils/userUtils.js'
 import { encodeCursor, decodeCursor, extractCursorDate } from '../utils/cursorPagination.js'
+import { validateEmail } from '../utils/validationUtils.js'
 
 const teams = new Hono<{ Variables: AuthVariables }>()
 
 // Get all teams (for transfer selection - team leaders can see other teams)
-teams.get('/all', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/all', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -40,7 +42,7 @@ teams.get('/all', authMiddleware, requireRole(['team_leader']), async (c) => {
     // OPTIMIZATION: Only fetch teams with same supervisor_id (filtered at database level)
     const { data: allTeams, error: teamsError } = await adminClient
       .from('teams')
-      .select('id, name, site_location, team_leader_id, supervisor_id, users!teams_team_leader_id_fkey(id, email, first_name, last_name, full_name)')
+      .select('id, name, site_location, team_leader_id, supervisor_id, users!teams_team_leader_id_fkey(id, email, first_name, last_name, full_name, profile_image_url)')
       .eq('supervisor_id', currentSupervisorId)
       .neq('id', currentTeamId) // Exclude current team
       .order('name', { ascending: true })
@@ -78,7 +80,7 @@ teams.get('/all', authMiddleware, requireRole(['team_leader']), async (c) => {
 })
 
 // Get team leader's team with members
-teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -104,7 +106,7 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
     
     const { data: team, error: teamError } = await adminClient
       .from('teams')
-      .select('*')
+      .select('id, name, site_location, team_leader_id, supervisor_id, created_at, updated_at')
       .eq('team_leader_id', user.id)
       .single()
 
@@ -162,7 +164,7 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
     // Get team members using admin client (bypasses RLS and ensures no shared state)
     const { data: members, error: membersError } = await adminClient
       .from('team_members')
-      .select('*')
+      .select('id, team_id, user_id, phone, compliance_percentage, created_at, updated_at')
       .eq('team_id', teamData.id)
     
     if (process.env.NODE_ENV === 'development') {
@@ -186,7 +188,7 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
       try {
         const { data: allUsers, error: usersError } = await adminClient
           .from('users')
-          .select('id, email, first_name, last_name, full_name, role')
+          .select('id, email, first_name, last_name, full_name, role, profile_image_url')
           .in('id', memberUserIds)
         
         if (usersError) {
@@ -317,8 +319,8 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
     const totalMembers = allSafeMembers.length
     
     // OPTIMIZATION: Apply role filter on backend (team leaders only see workers)
-    if (roleFilter === 'worker') {
-      safeMembers = safeMembers.filter((m: any) => m.users?.role === 'worker')
+    if (roleFilter === ROLES.WORKER) {
+      safeMembers = safeMembers.filter((m: any) => m.users?.role === ROLES.WORKER)
     }
     
     // OPTIMIZATION: Apply search filter on backend
@@ -347,7 +349,7 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
     // Get total exemptions and cases (optimized: parallel queries)
     // Use all members for statistics, not filtered ones
     const safeMemberIds = allSafeMembers.map((m: any) => m.user_id)
-    const workerIds = allSafeMembers.filter((m: any) => m.users?.role === 'worker').map((m: any) => m.user_id)
+    const workerIds = allSafeMembers.filter((m: any) => m.users?.role === ROLES.WORKER).map((m: any) => m.user_id)
     let totalExemptions = 0
     let totalCases = 0
     let activeWorkers = 0
@@ -436,7 +438,7 @@ teams.get('/', authMiddleware, requireRole(['team_leader']), async (c) => {
 })
 
 // Add team member (create user and add to team)
-teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.post('/members', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -469,14 +471,14 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
     }
 
     // Team leaders can only create worker accounts
-    if (role !== 'worker') {
+    if (role !== ROLES.WORKER) {
       return c.json({ error: 'Team leaders can only create worker accounts. Contact administrator for other roles.' }, 403)
     }
 
     // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-    if (!emailRegex.test(email)) {
-      return c.json({ error: 'Invalid email format' }, 400)
+    const emailValidation = validateEmail(email)
+    if (!emailValidation.valid) {
+      return c.json({ error: emailValidation.error }, 400)
     }
 
     // Use admin client to bypass RLS
@@ -545,7 +547,7 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
             phone: phone || null,
           },
         ])
-        .select('*')
+        .select('id, team_id, user_id, phone, compliance_percentage, created_at, updated_at')
         .single()
 
       if (memberError) {
@@ -639,7 +641,7 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
     })
 
     // Auto-generate quick login code for workers using lastname-number format
-    if (role === 'worker') {
+    if (role === ROLES.WORKER) {
       // Use last_name to generate PIN in format "lastname-number" (e.g., "delapiedra-232939")
       if (trimmedLastName) {
         try {
@@ -691,7 +693,7 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
           phone: phone || null,
         },
       ])
-      .select('*')
+      .select('id, team_id, user_id, phone, compliance_percentage, created_at, updated_at')
       .single()
 
     if (memberError) {
@@ -725,7 +727,7 @@ teams.post('/members', authMiddleware, requireRole(['team_leader']), async (c) =
 })
 
 // Update team member
-teams.patch('/members/:memberId', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.patch('/members/:memberId', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -765,7 +767,7 @@ teams.patch('/members/:memberId', authMiddleware, requireRole(['team_leader']), 
       .from('team_members')
       .update(updates)
       .eq('id', memberId)
-      .select('*')
+      .select('id, team_id, user_id, phone, compliance_percentage, created_at, updated_at')
       .single()
 
     if (updateError) {
@@ -843,7 +845,7 @@ teams.patch('/members/:memberId', authMiddleware, requireRole(['team_leader']), 
 })
 
 // Remove team member
-teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.delete('/members/:memberId', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -954,7 +956,7 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
     }
 
     // If member is a worker, delete their schedules before removing from team
-    if (userData.role === 'worker') {
+    if (userData.role === ROLES.WORKER) {
       // Delete all worker schedules (both active and inactive)
       const { error: deleteSchedulesError } = await adminClient
         .from('worker_schedules')
@@ -990,7 +992,7 @@ teams.delete('/members/:memberId', authMiddleware, requireRole(['team_leader']),
 })
 
 // Create team (for first time setup)
-teams.post('/', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.post('/', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1096,7 +1098,7 @@ function validateExceptionModification(exception: any) {
 
   // Check if exception was created by supervisor
   const creator = Array.isArray(exception.users) ? exception.users[0] : exception.users
-  if (creator && creator.role === 'supervisor') {
+  if (creator && creator.role === ROLES.SUPERVISOR) {
     return {
       error: 'Cannot modify exception: This exception was created by a Site Supervisor and cannot be modified until the supervisor closes the incident.',
       status: 403
@@ -1177,7 +1179,7 @@ async function invalidateAnalyticsCache(_adminClient: any, _teamId: string, _use
 }
 
 // Get all exceptions for team members (team leader only)
-teams.get('/exceptions', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/exceptions', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1219,7 +1221,7 @@ teams.get('/exceptions', authMiddleware, requireRole(['team_leader']), async (c)
 })
 
 // Get exception for a specific worker
-teams.get('/members/:memberId/exception', authMiddleware, requireRole(['team_leader', 'worker']), async (c) => {
+teams.get('/members/:memberId/exception', authMiddleware, requireRole([ROLES.TEAM_LEADER, ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1271,7 +1273,7 @@ teams.get('/members/:memberId/exception', authMiddleware, requireRole(['team_lea
 })
 
 // Get all check-ins for a worker by user_id (team leader only)
-teams.get('/members/:userId/check-ins', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/members/:userId/check-ins', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1303,7 +1305,7 @@ teams.get('/members/:userId/check-ins', authMiddleware, requireRole(['team_leade
     // Get all check-ins for this worker in the date range
     const { data: checkIns, error } = await adminClient
       .from('daily_checkins')
-      .select('*')
+      .select('id, user_id, check_in_date, check_in_time, pain_level, fatigue_level, stress_level, sleep_quality, predicted_readiness, additional_notes, shift_type, shift_start_time, shift_end_time, created_at, updated_at')
       .eq('user_id', userId)
       .gte('check_in_date', startDate)
       .lte('check_in_date', endDate)
@@ -1323,7 +1325,7 @@ teams.get('/members/:userId/check-ins', authMiddleware, requireRole(['team_leade
 })
 
 // Create or update exception for a worker (team leader only)
-teams.post('/members/:memberId/exception', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.post('/members/:memberId/exception', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1505,7 +1507,7 @@ teams.post('/members/:memberId/exception', authMiddleware, requireRole(['team_le
           created_by: user.id,
         },
       ])
-      .select('*')
+      .select('id, user_id, team_id, exception_type, reason, start_date, end_date, is_active, assigned_to_whs, clinician_id, created_by, created_at, updated_at')
       .single()
 
     if (error) {
@@ -1529,7 +1531,7 @@ teams.post('/members/:memberId/exception', authMiddleware, requireRole(['team_le
 })
 
 // Update exception
-teams.patch('/exceptions/:exceptionId', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.patch('/exceptions/:exceptionId', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1584,7 +1586,7 @@ teams.patch('/exceptions/:exceptionId', authMiddleware, requireRole(['team_leade
       .from('worker_exceptions')
       .update(updates)
       .eq('id', exceptionId)
-      .select('*')
+      .select('id, user_id, team_id, exception_type, reason, start_date, end_date, is_active, assigned_to_whs, clinician_id, created_by, created_at, updated_at')
       .single()
 
     if (error) {
@@ -1610,7 +1612,7 @@ teams.patch('/exceptions/:exceptionId', authMiddleware, requireRole(['team_leade
 })
 
 // Delete/deactivate exception
-teams.delete('/exceptions/:exceptionId', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.delete('/exceptions/:exceptionId', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1670,7 +1672,7 @@ teams.delete('/exceptions/:exceptionId', authMiddleware, requireRole(['team_lead
 })
 
 // Update team info
-teams.patch('/', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.patch('/', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1709,7 +1711,7 @@ teams.patch('/', authMiddleware, requireRole(['team_leader']), async (c) => {
 })
 
 // Get worker's team information (WORKER ONLY - supervisors should use supervisor endpoints)
-teams.get('/my-team', authMiddleware, requireRole(['worker']), async (c) => {
+teams.get('/my-team', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1718,7 +1720,7 @@ teams.get('/my-team', authMiddleware, requireRole(['worker']), async (c) => {
     }
 
     // Additional role verification - double check to ensure user is actually a worker
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[GET /teams/my-team] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -1872,7 +1874,7 @@ teams.get('/my-team', authMiddleware, requireRole(['worker']), async (c) => {
 // Get team members' daily check-ins for a specific date or date range (team leader only)
 // Query params: startDate (YYYY-MM-DD), endDate (YYYY-MM-DD) - optional, defaults to today
 //               date (YYYY-MM-DD) - single date (legacy support, converts to startDate=endDate=date)
-teams.get('/check-ins', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/check-ins', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1880,7 +1882,7 @@ teams.get('/check-ins', authMiddleware, requireRole(['team_leader']), async (c) 
     }
 
     // Additional role verification
-    if (user.role !== 'team_leader') {
+    if (user.role !== ROLES.TEAM_LEADER) {
       console.warn(`[GET /teams/check-ins] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access team-leader-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to team leaders' }, 403)
     }
@@ -2146,7 +2148,7 @@ teams.get('/check-ins', authMiddleware, requireRole(['team_leader']), async (c) 
       adminClient
         .from('users')
         .select('id, email, first_name, last_name, full_name')
-        .eq('role', 'worker')
+        .eq('role', ROLES.WORKER)
         .in('id', activeWorkerIds),
       checkInsQuery,
       warmUpsQuery,
@@ -2303,14 +2305,14 @@ teams.get('/check-ins', authMiddleware, requireRole(['team_leader']), async (c) 
 
 // Get team check-in analytics with filtering (team leader only)
 // Uses caching for improved performance
-teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/check-ins/analytics', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'team_leader') {
+    if (user.role !== ROLES.TEAM_LEADER) {
       console.warn(`[GET /teams/check-ins/analytics] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access team-leader-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to team leaders' }, 403)
     }
@@ -2519,7 +2521,7 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
     // Get check-ins for the date range
     const { data: checkIns, error: checkInsError } = await adminClient
       .from('daily_checkins')
-      .select('*')
+      .select('id, user_id, check_in_date, check_in_time, pain_level, fatigue_level, stress_level, sleep_quality, predicted_readiness, additional_notes, shift_type, shift_start_time, shift_end_time, created_at, updated_at')
       .in('user_id', allWorkerIds)
       .gte('check_in_date', startDate)
       .lte('check_in_date', endDate)
@@ -3006,14 +3008,14 @@ teams.get('/check-ins/analytics', authMiddleware, requireRole(['team_leader']), 
 })
 
 // Verify password for accessing logs (team leader only)
-teams.post('/logs/verify-password', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.post('/logs/verify-password', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'team_leader') {
+    if (user.role !== ROLES.TEAM_LEADER) {
       return c.json({ error: 'Forbidden' }, 403)
     }
 
@@ -3072,7 +3074,7 @@ teams.post('/logs/verify-password', authMiddleware, requireRole(['team_leader'])
 })
 
 // Get team member login logs (team leader only)
-teams.get('/logs', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/logs', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -3080,7 +3082,7 @@ teams.get('/logs', authMiddleware, requireRole(['team_leader']), async (c) => {
     }
 
     // Verify user is actually a team leader
-    if (user.role !== 'team_leader') {
+    if (user.role !== ROLES.TEAM_LEADER) {
       return c.json({ error: 'Forbidden: This endpoint is only accessible to team leaders' }, 403)
     }
 
@@ -3309,14 +3311,14 @@ teams.get('/logs', authMiddleware, requireRole(['team_leader']), async (c) => {
 // ============================================
 
 // Get notifications for Team Leader
-teams.get('/notifications', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.get('/notifications', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'team_leader') {
+    if (user.role !== ROLES.TEAM_LEADER) {
       return c.json({ error: 'Forbidden: This endpoint is only accessible to team leaders' }, 403)
     }
 
@@ -3328,7 +3330,7 @@ teams.get('/notifications', authMiddleware, requireRole(['team_leader']), async 
     // SECURITY: Only fetch notifications belonging to the authenticated team leader
     let query = adminClient
       .from('notifications')
-      .select('*')
+      .select('id, user_id, type, title, message, data, is_read, created_at, read_at')
       .eq('user_id', user.id) // Critical: Only get user's own notifications
       .order('created_at', { ascending: false })
       .limit(limit)
@@ -3366,14 +3368,14 @@ teams.get('/notifications', authMiddleware, requireRole(['team_leader']), async 
 })
 
 // Mark notification as read (Team Leader)
-teams.patch('/notifications/:notificationId/read', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.patch('/notifications/:notificationId/read', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'team_leader') {
+    if (user.role !== ROLES.TEAM_LEADER) {
       return c.json({ error: 'Forbidden: This endpoint is only accessible to team leaders' }, 403)
     }
 
@@ -3418,14 +3420,14 @@ teams.patch('/notifications/:notificationId/read', authMiddleware, requireRole([
 })
 
 // Mark all notifications as read (Team Leader)
-teams.patch('/notifications/read-all', authMiddleware, requireRole(['team_leader']), async (c) => {
+teams.patch('/notifications/read-all', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'team_leader') {
+    if (user.role !== ROLES.TEAM_LEADER) {
       return c.json({ error: 'Forbidden: This endpoint is only accessible to team leaders' }, 403)
     }
 

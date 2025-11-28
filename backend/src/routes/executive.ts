@@ -14,25 +14,22 @@ import { getExecutiveBusinessInfo } from '../utils/executiveHelpers.js'
 import { getTodayDateString, getStartOfWeekDateString } from '../utils/dateUtils.js'
 import { isExceptionActive, getExceptionDatesForScheduledDates } from '../utils/exceptionUtils.js'
 import { formatUserFullName } from '../utils/userUtils.js'
-import { formatDateString } from '../utils/dateTime.js'
+import { formatDateString, compareTime } from '../utils/dateTime.js'
+import { validateEmail } from '../utils/validationUtils.js'
 import { 
   getScheduledDatesInRange, 
   findNextScheduledDate 
 } from '../utils/scheduleUtils.js'
+import { ROLES, EXECUTIVE_MANAGED_ROLES, EXECUTIVE_ASSIGNABLE_ROLES } from '../constants/roles.js'
 
 const executive = new Hono()
-
-// Constants for executive-managed roles (centralized to avoid duplication)
-const EXECUTIVE_MANAGED_ROLES = ['supervisor', 'clinician', 'whs_control_center'] as const
-// Roles that executives can assign (includes team_leader and worker for hierarchy management)
-const EXECUTIVE_ASSIGNABLE_ROLES = [...EXECUTIVE_MANAGED_ROLES, 'team_leader', 'worker'] as const
 
 /**
  * Create user account (executive only)
  * Executives can create: supervisor, clinician, whs_control_center
  * Users automatically inherit executive's business_name and business_registration_number
  */
-executive.post('/users', authMiddleware, requireRole(['executive']), async (c) => {
+executive.post('/users', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -122,7 +119,7 @@ executive.post('/users', authMiddleware, requireRole(['executive']), async (c) =
  * Get all users created by this executive (supervisors, clinicians, whs_control_center)
  * Only returns users with the same business_name and business_registration_number as the executive
  */
-executive.get('/users', authMiddleware, requireRole(['executive']), async (c) => {
+executive.get('/users', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -210,7 +207,7 @@ executive.get('/users', authMiddleware, requireRole(['executive']), async (c) =>
  * Get user statistics
  * Only counts users with the same business_name and business_registration_number as the executive
  */
-executive.get('/stats', authMiddleware, requireRole(['executive']), async (c) => {
+executive.get('/stats', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -276,7 +273,7 @@ executive.get('/stats', authMiddleware, requireRole(['executive']), async (c) =>
  * Get single user by ID (executive only)
  * Only returns user if they have the same business_name and business_registration_number as the executive
  */
-executive.get('/users/:id', authMiddleware, requireRole(['executive']), async (c) => {
+executive.get('/users/:id', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -331,7 +328,7 @@ executive.get('/users/:id', authMiddleware, requireRole(['executive']), async (c
  * Can update: email, role, first_name, last_name, password
  * Business info cannot be changed (inherited from executive)
  */
-executive.patch('/users/:id', authMiddleware, requireRole(['executive']), async (c) => {
+executive.patch('/users/:id', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -369,12 +366,11 @@ executive.patch('/users/:id', authMiddleware, requireRole(['executive']), async 
     const updateData: any = {}
     
     if (email !== undefined) {
-      const trimmedEmail = email.trim().toLowerCase()
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-      if (!emailRegex.test(trimmedEmail)) {
-        return c.json({ error: 'Invalid email format' }, 400)
+      const emailValidation = validateEmail(email)
+      if (!emailValidation.valid) {
+        return c.json({ error: emailValidation.error }, 400)
       }
-      updateData.email = trimmedEmail
+      updateData.email = emailValidation.value
     }
 
     if (role !== undefined) {
@@ -450,7 +446,7 @@ executive.patch('/users/:id', authMiddleware, requireRole(['executive']), async 
  * Delete user (executive only)
  * Only allows deletion of users with matching business info
  */
-executive.delete('/users/:id', authMiddleware, requireRole(['executive']), async (c) => {
+executive.delete('/users/:id', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -533,7 +529,7 @@ const getEmptySafetyEngagementResponse = (startDate?: string, endDate?: string) 
  * Calculates work readiness percentage based on check-ins for all workers under executive's business
  * SECURITY: Only returns data for workers under the executive's business (filtered by business_name and business_registration_number)
  */
-executive.get('/safety-engagement', authMiddleware, requireRole(['executive']), async (c) => {
+executive.get('/safety-engagement', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -559,7 +555,7 @@ executive.get('/safety-engagement', authMiddleware, requireRole(['executive']), 
     const { data: supervisors } = await adminClient
       .from('users')
       .select('id')
-      .eq('role', 'supervisor')
+      .eq('role', ROLES.SUPERVISOR)
       .eq('business_name', executiveData.business_name)
       .eq('business_registration_number', executiveData.business_registration_number)
 
@@ -864,7 +860,7 @@ executive.get('/safety-engagement', authMiddleware, requireRole(['executive']), 
 
 // Get all supervisors with hierarchy (executive only)
 // Shows supervisors -> team leaders -> workers under executive's business
-executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c) => {
+executive.get('/hierarchy', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -883,8 +879,8 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
     // Get all supervisors with matching business info
     const { data: supervisors, error: supervisorsError } = await adminClient
       .from('users')
-      .select('id, email, first_name, last_name, full_name, role')
-      .eq('role', 'supervisor')
+      .select('id, email, first_name, last_name, full_name, role, profile_image_url')
+      .eq('role', ROLES.SUPERVISOR)
       .eq('business_name', executiveData.business_name)
       .eq('business_registration_number', executiveData.business_registration_number)
 
@@ -918,7 +914,7 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
     if (teamLeaderIds.length > 0) {
       const { data: leaders, error: leadersError } = await adminClient
         .from('users')
-        .select('id, email, first_name, last_name, full_name, role')
+        .select('id, email, first_name, last_name, full_name, role, profile_image_url')
         .in('id', teamLeaderIds)
 
       if (leadersError) {
@@ -949,7 +945,7 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
     if (workerIds.length > 0) {
       const { data: workerUsers, error: workersError } = await adminClient
         .from('users')
-        .select('id, email, first_name, last_name, full_name, role')
+        .select('id, email, first_name, last_name, full_name, role, profile_image_url')
         .in('id', workerIds)
 
       if (workersError) {
@@ -979,6 +975,7 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
           last_name: worker.last_name,
           full_name: formatUserFullName(worker),
           role: worker.role,
+          profile_image_url: worker.profile_image_url || null,
         })
       }
     })
@@ -1005,6 +1002,7 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
           last_name: teamLeader.last_name,
           full_name: formatUserFullName(teamLeader),
           role: teamLeader.role,
+          profile_image_url: teamLeader.profile_image_url || null,
         } : null,
         workers: members,
         workers_count: members.length,
@@ -1024,6 +1022,7 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
         last_name: supervisor.last_name,
         full_name: formatUserFullName(supervisor),
         role: supervisor.role,
+        profile_image_url: supervisor.profile_image_url || null,
         teams_count: teams.length,
         team_leaders_count: totalTeamLeaders,
         workers_count: totalWorkers,
@@ -1039,7 +1038,7 @@ executive.get('/hierarchy', authMiddleware, requireRole(['executive']), async (c
 })
 
 // Get workers with check-in streak data (executive only)
-executive.get('/workers/streaks', authMiddleware, requireRole(['executive']), async (c) => {
+executive.get('/workers/streaks', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1063,7 +1062,7 @@ executive.get('/workers/streaks', authMiddleware, requireRole(['executive']), as
     const { data: supervisors } = await adminClient
       .from('users')
       .select('id')
-      .eq('role', 'supervisor')
+      .eq('role', ROLES.SUPERVISOR)
       .eq('business_name', executiveData.business_name)
       .eq('business_registration_number', executiveData.business_registration_number)
 
@@ -1102,7 +1101,7 @@ executive.get('/workers/streaks', authMiddleware, requireRole(['executive']), as
       .from('users')
       .select('id, email, first_name, last_name, full_name, role')
       .in('id', workerIds)
-      .eq('role', 'worker')
+      .eq('role', ROLES.WORKER)
 
     if (!workers || workers.length === 0) {
       return c.json({ workers: [] })
@@ -1119,7 +1118,7 @@ executive.get('/workers/streaks', authMiddleware, requireRole(['executive']), as
     // Get all schedules for all workers
     const { data: allSchedules } = await adminClient
       .from('worker_schedules')
-      .select('*')
+      .select('id, worker_id, team_id, scheduled_date, day_of_week, start_time, end_time, effective_date, expiry_date, is_active, requires_daily_checkin, daily_checkin_start_time, daily_checkin_end_time, created_at, updated_at')
       .in('worker_id', workerIds)
       .eq('is_active', true)
 
@@ -1248,8 +1247,65 @@ executive.get('/workers/streaks', authMiddleware, requireRole(['executive']), as
       
       // Find missed schedule dates (past scheduled dates without check-in AND without exception)
       // Exception dates should NOT be counted as missed schedules
+      // IMPORTANT: Today should NOT be counted as missed unless the check-in window has already closed
+      const now = new Date()
+      const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
+      const todayStr = getTodayDateString()
+      
+      // Get today's schedule to check if check-in window has closed
+      let todaySchedule = null
+      if (pastScheduledDates.has(todayStr) && workerSchedules.length > 0) {
+        // Find today's schedule (check both single-date and recurring)
+        const todayDayOfWeek = today.getDay()
+        todaySchedule = workerSchedules.find((schedule: any) => {
+          // Check single-date schedule
+          if (schedule.scheduled_date === todayStr) {
+            return true
+          }
+          // Check recurring schedule
+          if (schedule.day_of_week === todayDayOfWeek) {
+            // Check if within effective date range
+            const effectiveDate = schedule.effective_date ? new Date(schedule.effective_date) : null
+            const expiryDate = schedule.expiry_date ? new Date(schedule.expiry_date) : null
+            if (effectiveDate && today < effectiveDate) return false
+            if (expiryDate && today > expiryDate) return false
+            return true
+          }
+          return false
+        })
+      }
+      
+      // Check if today's check-in window has closed
+      let todayWindowClosed = false
+      if (todaySchedule && todaySchedule.requires_daily_checkin && todaySchedule.daily_checkin_end_time) {
+        // Window has closed if current time is past the end time
+        todayWindowClosed = compareTime(currentTime, todaySchedule.daily_checkin_end_time) > 0
+      } else if (todaySchedule && !todaySchedule.requires_daily_checkin) {
+        // If schedule doesn't require daily check-in, consider window closed at end of day (23:59)
+        todayWindowClosed = compareTime(currentTime, '23:59') > 0
+      }
+      
       const missedScheduleDates = Array.from(pastScheduledDates)
-        .filter(date => !workerCheckIns.has(date) && !scheduledDatesWithExceptions.has(date))
+        .filter(date => {
+          // Skip if has check-in or exception
+          if (workerCheckIns.has(date) || scheduledDatesWithExceptions.has(date)) {
+            return false
+          }
+          
+          // CRITICAL: Only count dates that are in the past or today (not future dates)
+          // Skip any date that is after today
+          if (date > todayStr) {
+            return false
+          }
+          
+          // For today: only count as missed if window has closed
+          if (date === todayStr) {
+            return todayWindowClosed
+          }
+          
+          // For past dates (before today): count as missed if no check-in and no exception
+          return true
+        })
         .sort()
         .reverse() // Most recent first
 
@@ -1307,7 +1363,7 @@ executive.get('/workers/streaks', authMiddleware, requireRole(['executive']), as
 })
 
 // Get worker check-in history (executive only)
-executive.get('/workers/:workerId/check-ins', authMiddleware, requireRole(['executive']), async (c) => {
+executive.get('/workers/:workerId/check-ins', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1343,7 +1399,7 @@ executive.get('/workers/:workerId/check-ins', authMiddleware, requireRole(['exec
       .from('users')
       .select('id, role')
       .eq('id', workerId)
-      .eq('role', 'worker')
+      .eq('role', ROLES.WORKER)
       .single()
 
     if (workerError || !worker) {
@@ -1416,7 +1472,7 @@ executive.get('/workers/:workerId/check-ins', authMiddleware, requireRole(['exec
 
 // Update user role (executive only)
 // Allows executive to change roles of users under their business
-executive.patch('/users/:id/role', authMiddleware, requireRole(['executive']), async (c) => {
+executive.patch('/users/:id/role', authMiddleware, requireRole([ROLES.EXECUTIVE]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {

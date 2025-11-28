@@ -8,6 +8,7 @@ import { getAdminClient } from '../utils/adminClient.js'
 import { isValidEmail } from '../middleware/security.js'
 // Import optimized utility functions
 import { getTodayDateString, getTodayDate, getStartOfWeekDateString, getFirstDayOfMonthString, dateToDateString } from '../utils/dateUtils.js'
+import { ROLES } from '../constants/roles.js'
 import { validateTeamId, validatePassword, validateStringInput, validateEmail } from '../utils/validationUtils.js'
 import { isExceptionActive, getWorkersWithActiveExceptions } from '../utils/exceptionUtils.js'
 import { formatTeamLeader, formatUserFullName, getUserInitials } from '../utils/userUtils.js'
@@ -17,7 +18,7 @@ import { calculateAge, MINIMUM_AGE } from '../utils/ageUtils.js'
 const supervisor = new Hono<{ Variables: AuthVariables }>()
 
 // Get supervisor dashboard data
-supervisor.get('/dashboard', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/dashboard', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   // Set no-cache headers to ensure fresh data
   c.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
   c.header('Pragma', 'no-cache')
@@ -133,7 +134,7 @@ supervisor.get('/dashboard', authMiddleware, requireRole(['supervisor']), async 
     const { data: allWorkers, error: workersError } = await adminClient
       .from('users')
       .select('id, email, first_name, last_name, full_name')
-      .eq('role', 'worker')
+      .eq('role', ROLES.WORKER)
       .in('id', activeWorkerIdsForDashboard)
 
     if (workersError) {
@@ -346,7 +347,7 @@ supervisor.get('/dashboard', authMiddleware, requireRole(['supervisor']), async 
 })
 
 // Create team leader (supervisor can create team leaders under them)
-supervisor.post('/team-leaders', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.post('/team-leaders', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -589,7 +590,7 @@ supervisor.post('/team-leaders', authMiddleware, requireRole(['supervisor']), as
 })
 
 // Get all teams created by this supervisor
-supervisor.get('/teams', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/teams', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -628,7 +629,7 @@ supervisor.get('/teams', authMiddleware, requireRole(['supervisor']), async (c) 
       teamLeaderIds.length > 0
         ? adminClient
             .from('users')
-            .select('id, email, first_name, last_name, full_name')
+            .select('id, email, first_name, last_name, full_name, profile_image_url')
             .in('id', teamLeaderIds)
         : Promise.resolve({ data: [] }),
       teamIds.length > 0
@@ -729,7 +730,7 @@ supervisor.get('/teams', authMiddleware, requireRole(['supervisor']), async (c) 
 })
 
 // Delete team (supervisor only - requires password verification)
-supervisor.delete('/teams/:teamId', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.delete('/teams/:teamId', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -894,7 +895,7 @@ supervisor.delete('/teams/:teamId', authMiddleware, requireRole(['supervisor']),
 })
 
 // Get team members for a specific team (supervisor can view any team they supervise)
-supervisor.get('/teams/:teamId/members', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/teams/:teamId/members', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -924,7 +925,7 @@ supervisor.get('/teams/:teamId/members', authMiddleware, requireRole(['superviso
         .single(),
       adminClient
         .from('team_members')
-        .select('*')
+        .select('id, team_id, user_id, phone, compliance_percentage, created_at, updated_at')
         .eq('team_id', teamId),
     ])
 
@@ -960,7 +961,7 @@ supervisor.get('/teams/:teamId/members', authMiddleware, requireRole(['superviso
     ] = await Promise.all([
       adminClient
         .from('users')
-        .select('id, email, first_name, last_name, full_name, role')
+        .select('id, email, first_name, last_name, full_name, role, profile_image_url')
         .in('id', memberUserIds),
       adminClient
         .from('worker_exceptions')
@@ -1042,7 +1043,7 @@ supervisor.get('/teams/:teamId/members', authMiddleware, requireRole(['superviso
 // - Expected check-ins are based on team leader's schedules (Monday-Friday, etc.)
 // - Only counts scheduled working days, not all days in the date range
 // Uses caching for improved performance
-supervisor.get('/analytics', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/analytics', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1702,7 +1703,7 @@ supervisor.get('/analytics', authMiddleware, requireRole(['supervisor']), async 
 // NOTE: Automatically includes exceptions created/updated by team leaders via "Manage Exception"
 // Only shows incident-worthy exception types: accident, injury, medical_leave, other
 // Transfer exceptions are excluded (administrative action, not an incident)
-supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/incidents', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1941,6 +1942,33 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
       }
     })
 
+    // Fetch photo URLs from incidents table for these exceptions
+    const exceptionIds = (incidents || []).map((i: any) => i.user_id)
+    const incidentDates = (incidents || []).map((i: any) => i.start_date)
+    
+    // Get incidents with photos (match by user_id and incident_date)
+    let incidentPhotos = new Map<string, string>()
+    let incidentAiAnalysis = new Map<string, any>()
+    if (exceptionIds.length > 0) {
+      const { data: incidentRecords } = await adminClient
+        .from('incidents')
+        .select('user_id, incident_date, photo_url, ai_analysis_result')
+        .in('user_id', exceptionIds)
+      
+      if (incidentRecords) {
+        incidentRecords.forEach((record: any) => {
+          // Create key from user_id + incident_date for matching
+          const key = `${record.user_id}-${record.incident_date}`
+          if (record.photo_url) {
+            incidentPhotos.set(key, record.photo_url)
+          }
+          if (record.ai_analysis_result) {
+            incidentAiAnalysis.set(key, record.ai_analysis_result)
+          }
+        })
+      }
+    }
+
     // Format incidents
     let formattedIncidents = (incidents || []).map((incident: any) => {
       const user = Array.isArray(incident.users) ? incident.users[0] : incident.users
@@ -1964,8 +1992,13 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
       const approvedAt = parsedNotes?.approved_at || null
       const returnToWorkDutyType = returnToWorkData.dutyType
       const returnToWorkDate = returnToWorkData.returnDate
-      const clinicalNotes = parsedNotes?.clinical_notes || null
-      const clinicalNotesUpdatedAt = parsedNotes?.clinical_notes_updated_at || null
+      // SECURITY: Clinical notes are confidential - only visible to worker and clinician
+      // Supervisors should NOT see clinical notes
+
+      // Get photo URL and AI analysis from incidents table
+      const photoKey = `${incident.user_id}-${incident.start_date}`
+      const photoUrl = incidentPhotos.get(photoKey) || null
+      const aiAnalysisResult = incidentAiAnalysis.get(photoKey) || null
 
       return {
         id: incident.id,
@@ -1997,8 +2030,9 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
         approvedAt: approvedAt,
         returnToWorkDutyType: returnToWorkDutyType || incident.return_to_work_duty_type || null,
         returnToWorkDate: returnToWorkDate || incident.return_to_work_date || null,
-        clinicalNotes: clinicalNotes,
-        clinicalNotesUpdatedAt: clinicalNotesUpdatedAt,
+        // SECURITY: Clinical notes removed - confidential to worker/clinician only
+        photoUrl: photoUrl,
+        aiAnalysisResult: aiAnalysisResult,
         createdAt: incident.created_at,
         updatedAt: incident.updated_at,
       }
@@ -2086,14 +2120,14 @@ supervisor.get('/incidents', authMiddleware, requireRole(['supervisor']), async 
 })
 
 // Report new incident (create exception for worker)
-supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.post('/incidents', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    const { workerId, teamId, type, reason, startDate, endDate } = await c.req.json()
+    const { workerId, teamId, type, reason, startDate, endDate, transferToTeamId } = await c.req.json()
 
     // Validation
     if (!workerId || !teamId || !type || !startDate) {
@@ -2103,6 +2137,11 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
     const validTypes = ['transfer', 'accident', 'injury', 'medical_leave', 'other']
     if (!validTypes.includes(type)) {
       return c.json({ error: 'Invalid incident type' }, 400)
+    }
+
+    // If transfer, require transferToTeamId
+    if (type === 'transfer' && !transferToTeamId) {
+      return c.json({ error: 'Transfer requires selecting a target team' }, 400)
     }
 
     const adminClient = getAdminClient()
@@ -2190,12 +2229,97 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
       // Don't fail the incident creation if schedule deactivation fails
     }
 
+    // If transfer, verify target team and move worker
+    let finalTeamId = teamId
+    if (type === 'transfer') {
+      if (transferToTeamId === teamId) {
+        return c.json({ error: 'Cannot transfer worker to the same team' }, 400)
+      }
+
+      // Verify target team belongs to supervisor
+      const { data: targetTeam, error: targetTeamError } = await adminClient
+        .from('teams')
+        .select('id, name, supervisor_id, team_leader_id')
+        .eq('id', transferToTeamId)
+        .eq('supervisor_id', user.id)
+        .single()
+
+      if (targetTeamError || !targetTeam) {
+        return c.json({ error: 'Target team not found or unauthorized' }, 404)
+      }
+
+      // Get team member record to update
+      const { data: memberRecord, error: memberRecordError } = await adminClient
+        .from('team_members')
+        .select('id')
+        .eq('team_id', teamId)
+        .eq('user_id', workerId)
+        .single()
+
+      if (memberRecordError || !memberRecord) {
+        return c.json({ error: 'Team member record not found' }, 404)
+      }
+
+      // Move worker to new team
+      const { error: transferError } = await adminClient
+        .from('team_members')
+        .update({ team_id: transferToTeamId })
+        .eq('id', memberRecord.id)
+
+      if (transferError) {
+        console.error('[POST /supervisor/incidents] Error transferring worker:', transferError)
+        return c.json({ error: 'Failed to transfer worker to new team', details: transferError.message }, 500)
+      }
+
+      finalTeamId = transferToTeamId
+
+      // Notify destination team leader about the transfer
+      if (targetTeam.team_leader_id) {
+        try {
+          const { data: workerData } = await adminClient
+            .from('users')
+            .select('first_name, last_name, full_name, email')
+            .eq('id', workerId)
+            .single()
+
+          const workerName = workerData?.full_name || 
+                            (workerData?.first_name && workerData?.last_name 
+                              ? `${workerData.first_name} ${workerData.last_name}`
+                              : workerData?.email || 'Unknown Worker')
+          const supervisorName = (user as any).first_name || user.email || 'Site Supervisor'
+
+          await adminClient
+            .from('notifications')
+            .insert([{
+              user_id: targetTeam.team_leader_id,
+              type: 'system',
+              title: '👤 Worker Transferred',
+              message: `${supervisorName} has transferred ${workerName} to your team (${targetTeam.name}).`,
+              data: {
+                worker_id: workerId,
+                worker_name: workerName,
+                worker_email: workerData?.email || '',
+                from_team_id: teamId,
+                to_team_id: transferToTeamId,
+                to_team_name: targetTeam.name,
+                supervisor_id: user.id,
+                supervisor_name: supervisorName,
+              },
+              is_read: false,
+            }])
+        } catch (notifyError: any) {
+          console.error('[POST /supervisor/incidents] Error creating transfer notification:', notifyError)
+          // Don't fail the transfer if notification fails
+        }
+      }
+    }
+
     // Create exception (incident)
     const { data: newException, error: createError } = await adminClient
       .from('worker_exceptions')
       .insert([{
         user_id: workerId,
-        team_id: teamId,
+        team_id: finalTeamId,
         exception_type: type,
         reason: reason || '',
         start_date: startDate,
@@ -2217,7 +2341,7 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
       const [workerResult, teamResult] = await Promise.all([
         adminClient
           .from('users')
-          .select('id, email, first_name, last_name, full_name')
+          .select('id, email, first_name, last_name, full_name, profile_image_url')
           .eq('id', workerId)
           .single(),
         adminClient
@@ -2282,6 +2406,7 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
             worker_id: workerId,
             worker_name: workerName,
             worker_email: worker?.email || '',
+            worker_profile_image_url: worker?.profile_image_url || null,
             incident_type: type,
             incident_type_label: incidentTypeLabel,
             supervisor_id: user.id,
@@ -2321,6 +2446,7 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
 
     return c.json({ 
       incident: newException,
+      transferred: type === 'transfer',
       deactivatedSchedules: deactivatedScheduleCount,
       ...(deactivatedScheduleCount > 0 && {
         scheduleMessage: `${deactivatedScheduleCount} active schedule(s) were automatically deactivated. Schedule data is preserved for analytics.`
@@ -2333,7 +2459,7 @@ supervisor.post('/incidents', authMiddleware, requireRole(['supervisor']), async
 })
 
 // Assign incident to WHS (supervisor approval)
-supervisor.patch('/incidents/:incidentId/assign-to-whs', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.patch('/incidents/:incidentId/assign-to-whs', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2370,10 +2496,12 @@ supervisor.patch('/incidents/:incidentId/assign-to-whs', authMiddleware, require
         start_date,
         created_at,
         users!worker_exceptions_user_id_fkey(
+          id,
           first_name,
           last_name,
           full_name,
-          email
+          email,
+          profile_image_url
         ),
         teams!worker_exceptions_team_id_fkey(
           name,
@@ -2418,7 +2546,7 @@ supervisor.patch('/incidents/:incidentId/assign-to-whs', authMiddleware, require
     const { data: whsUsers, error: whsUsersError } = await adminClient
       .from('users')
       .select('id, email, first_name, last_name')
-      .eq('role', 'whs_control_center')
+      .eq('role', ROLES.WHS_CONTROL_CENTER)
 
     if (!whsUsersError && whsUsers && whsUsers.length > 0) {
       const worker = Array.isArray(incidentDetails.users) ? incidentDetails.users[0] : incidentDetails.users
@@ -2445,8 +2573,10 @@ supervisor.patch('/incidents/:incidentId/assign-to-whs', authMiddleware, require
         data: {
           incident_id: incidentId,
           case_number: caseNumber,
+          worker_id: worker?.id || null,
           worker_name: workerName,
           worker_email: worker?.email || '',
+          worker_profile_image_url: worker?.profile_image_url || null,
           team_name: team?.name || '',
           site_location: team?.site_location || '',
           incident_type: incidentDetails.exception_type,
@@ -2475,7 +2605,7 @@ supervisor.patch('/incidents/:incidentId/assign-to-whs', authMiddleware, require
 })
 
 // Close incident (deactivate exception)
-supervisor.patch('/incidents/:incidentId/close', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.patch('/incidents/:incidentId/close', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2572,7 +2702,7 @@ supervisor.patch('/incidents/:incidentId/close', authMiddleware, requireRole(['s
 
 // Get workers for reporting incident (supervisor's teams only)
 // NOTE: Only returns users with role='worker' - team leaders are excluded
-supervisor.get('/incidents/workers', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/incidents/workers', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2619,7 +2749,7 @@ supervisor.get('/incidents/workers', authMiddleware, requireRole(['supervisor'])
     const { data: workers, error: workersError } = await adminClient
       .from('users')
       .select('id, email, first_name, last_name, full_name')
-      .eq('role', 'worker')
+      .eq('role', ROLES.WORKER)
       .in('id', workerIds)
 
     if (workersError) {
@@ -2666,7 +2796,7 @@ supervisor.get('/incidents/workers', authMiddleware, requireRole(['supervisor'])
 
 // Get supervisor's submitted incidents for monitoring (Kanban board view)
 // Returns incidents grouped by status: In Progress, Rehabilitation, Completed
-supervisor.get('/my-incidents', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/my-incidents', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2722,7 +2852,9 @@ supervisor.get('/my-incidents', authMiddleware, requireRole(['supervisor']), asy
           email,
           first_name,
           last_name,
-          full_name
+          full_name,
+          gender,
+          date_of_birth
         ),
         teams!worker_exceptions_team_id_fkey(
           id,
@@ -2741,10 +2873,43 @@ supervisor.get('/my-incidents', authMiddleware, requireRole(['supervisor']), asy
       return c.json({ error: 'Failed to fetch incidents', details: incidentsError.message }, 500)
     }
 
+    // Fetch incident photos and AI analysis for all incidents
+    const incidentIds = (incidents || []).map((inc: any) => inc.user_id)
+    const incidentDates = (incidents || []).map((inc: any) => inc.start_date)
+    
+    // Get all incident data in one query
+    let incidentDataMap = new Map()
+    if (incidentIds.length > 0) {
+      const { data: incidentPhotos } = await adminClient
+        .from('incidents')
+        .select('id, user_id, incident_date, photo_url, ai_analysis_result')
+        .in('user_id', incidentIds)
+      
+      // Map by user_id + incident_date for O(1) lookup
+      incidentPhotos?.forEach((photo: any) => {
+        const key = `${photo.user_id}-${photo.incident_date}`
+        incidentDataMap.set(key, photo)
+      })
+    }
+
     // Process incidents and extract case status
     const processedIncidents = (incidents || []).map((incident: any) => {
       const worker = incident.users || {}
       const team = incident.teams || {}
+      
+      // Get incident photo and AI analysis
+      const incidentDataKey = `${incident.user_id}-${incident.start_date}`
+      const incidentData = incidentDataMap.get(incidentDataKey)
+      let photoUrl = null
+      let aiAnalysisResult = null
+      
+      if (incidentData) {
+        // Use proxy URL for security
+        if (incidentData.photo_url) {
+          photoUrl = `/api/worker/incident-photo/${incidentData.id}`
+        }
+        aiAnalysisResult = incidentData.ai_analysis_result || null
+      }
       
       // Extract case status from notes
       const caseStatus = getCaseStatusFromNotes(incident.notes)
@@ -2763,8 +2928,7 @@ supervisor.get('/my-incidents', authMiddleware, requireRole(['supervisor']), asy
       const whsApprovedAt = parsedNotes?.whs_approved_at || null
       const returnToWorkDutyType = returnToWorkData.dutyType
       const returnToWorkDate = returnToWorkData.returnDate
-      const clinicalNotes = parsedNotes?.clinical_notes || null
-      const clinicalNotesUpdatedAt = parsedNotes?.clinical_notes_updated_at || null
+      // SECURITY: Clinical notes are confidential - only visible to worker and clinician
       
       // Determine status category for Kanban board
       let statusCategory: 'in_progress' | 'rehabilitation' | 'completed' = 'in_progress'
@@ -2786,6 +2950,8 @@ supervisor.get('/my-incidents', authMiddleware, requireRole(['supervisor']), asy
                      ? `${worker.first_name} ${worker.last_name}`
                      : worker.email || 'Unknown'),
         workerEmail: worker.email || '',
+        workerGender: worker.gender || null,
+        workerAge: worker.date_of_birth ? calculateAge(worker.date_of_birth) : null,
         teamId: incident.team_id,
         teamName: team.name || 'Unknown Team',
         siteLocation: team.site_location || null,
@@ -2804,10 +2970,12 @@ supervisor.get('/my-incidents', authMiddleware, requireRole(['supervisor']), asy
         whsApprovedAt,
         returnToWorkDutyType,
         returnToWorkDate,
-        clinicalNotes,
-        clinicalNotesUpdatedAt,
+        // SECURITY: Clinical notes removed - confidential to worker/clinician only
         createdAt: incident.created_at,
         updatedAt: incident.updated_at,
+        // ✅ Incident photo and AI analysis
+        photoUrl,
+        aiAnalysisResult,
       }
     })
 
@@ -2845,7 +3013,7 @@ supervisor.get('/my-incidents', authMiddleware, requireRole(['supervisor']), asy
 // ============================================
 
 // Get notifications for Supervisor
-supervisor.get('/notifications', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.get('/notifications', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2860,7 +3028,7 @@ supervisor.get('/notifications', authMiddleware, requireRole(['supervisor']), as
     // SECURITY: Only fetch notifications belonging to the authenticated supervisor
     let query = adminClient
       .from('notifications')
-      .select('*')
+      .select('id, user_id, type, title, message, data, is_read, created_at, read_at')
       .eq('user_id', user.id) // Critical: Only get user's own notifications
       .order('created_at', { ascending: false })
       .limit(limit)
@@ -2898,7 +3066,7 @@ supervisor.get('/notifications', authMiddleware, requireRole(['supervisor']), as
 })
 
 // Mark notification as read (Supervisor)
-supervisor.patch('/notifications/:notificationId/read', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.patch('/notifications/:notificationId/read', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2942,7 +3110,7 @@ supervisor.patch('/notifications/:notificationId/read', authMiddleware, requireR
 })
 
 // Mark all notifications as read (Supervisor)
-supervisor.patch('/notifications/read-all', authMiddleware, requireRole(['supervisor']), async (c) => {
+supervisor.patch('/notifications/read-all', authMiddleware, requireRole([ROLES.SUPERVISOR]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {

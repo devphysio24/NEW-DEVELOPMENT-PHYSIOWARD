@@ -9,6 +9,8 @@ import { getAdminClient } from '../utils/adminClient.js'
 import { ensureUserRecordExists } from '../utils/userUtils.js'
 import { generateUniqueQuickLoginCode, isValidQuickLoginCode, generateUniquePinCode } from '../utils/quickLoginCode.js'
 import { cascadeBusinessInfoUpdate } from '../utils/executiveHelpers.js'
+import { ROLES, VALID_ROLES, PUBLIC_REGISTRATION_ROLES } from '../constants/roles.js'
+import { validateEmail, validatePassword } from '../utils/validationUtils.js'
 
 /**
  * Helper function to set secure cookies
@@ -188,13 +190,13 @@ auth.post('/register', async (c) => {
     }
     
     // Validate role
-    const validRoles = ['worker', 'supervisor', 'whs_control_center', 'executive', 'clinician', 'team_leader', 'admin']
+    const validRoles = VALID_ROLES
     if (!role || !validRoles.includes(role)) {
       return c.json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` }, 400)
     }
 
     // Supervisor-specific validation: business_name and business_registration_number are required
-    if (role === 'supervisor') {
+    if (role === ROLES.SUPERVISOR) {
       if (!business_name || typeof business_name !== 'string' || !business_name.trim()) {
         return c.json({ error: 'Business Name is required for supervisors' }, 400)
       }
@@ -204,14 +206,16 @@ auth.post('/register', async (c) => {
       }
     }
 
-    if (password.length < 6) {
-      return c.json({ error: 'Password must be at least 6 characters' }, 400)
+    // Validate password
+    const passwordValidation = validatePassword(password)
+    if (!passwordValidation.valid) {
+      return c.json({ error: passwordValidation.error }, 400)
     }
 
     // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-    if (!emailRegex.test(email)) {
-      return c.json({ error: 'Invalid email format' }, 400)
+    const emailValidation = validateEmail(email)
+    if (!emailValidation.valid) {
+      return c.json({ error: emailValidation.error }, 400)
     }
 
     // Hash password with bcrypt
@@ -272,12 +276,12 @@ auth.post('/register', async (c) => {
     }
 
     // Auto-generate quick login code for workers
-    if (role === 'worker') {
+    if (role === ROLES.WORKER) {
       userInsertData.quick_login_code = await generateUniqueQuickLoginCode()
     }
 
     // Add business fields for supervisors
-    if (role === 'supervisor') {
+    if (role === ROLES.SUPERVISOR) {
       userInsertData.business_name = business_name.trim()
       userInsertData.business_registration_number = business_registration_number.trim()
     }
@@ -505,7 +509,7 @@ auth.post('/quick-login', async (c) => {
       .from('users')
       .select('id, email, role, first_name, last_name, full_name')
       .eq('quick_login_code', trimmedCode)
-      .eq('role', 'worker')
+      .eq('role', ROLES.WORKER)
       .maybeSingle()
 
     if (dbError || !userData) {
@@ -918,7 +922,7 @@ auth.get('/me', async (c) => {
     // Get user role from database - try with regular client first
     let { data: userData, error: dbError } = await supabase
       .from('users')
-      .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code, gender, date_of_birth')
+      .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code, gender, date_of_birth, profile_image_url')
       .eq('id', user.id)
       .single()
 
@@ -929,7 +933,7 @@ auth.get('/me', async (c) => {
       const adminClient = getAdminClient()
       const { data: adminUserData, error: adminError } = await adminClient
         .from('users')
-        .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code, gender, date_of_birth')
+        .select('id, email, role, first_name, last_name, full_name, business_name, business_registration_number, quick_login_code, gender, date_of_birth, profile_image_url')
         .eq('id', user.id)
         .single()
 
@@ -956,6 +960,7 @@ auth.get('/me', async (c) => {
             quick_login_code: null,
             gender: null,
             date_of_birth: null,
+            profile_image_url: null,
           }
         }
       } else {
@@ -997,6 +1002,7 @@ auth.get('/me', async (c) => {
         quick_login_code: userData.quick_login_code || null,
         gender: userData.gender || null,
         date_of_birth: userData.date_of_birth || null,
+        profile_image_url: userData.profile_image_url || null,
       },
     })
   } catch (error: any) {
@@ -1007,14 +1013,15 @@ auth.get('/me', async (c) => {
 })
 
 // Update user role (admin only)
-auth.patch('/users/:id/role', authMiddleware, requireRole(['admin']), async (c) => {
+auth.patch('/users/:id/role', authMiddleware, requireRole([ROLES.ADMIN]), async (c) => {
   try {
     const userId = c.req.param('id')
     const { role } = await c.req.json()
 
-    const validRoles = ['worker', 'supervisor', 'whs_control_center', 'executive', 'clinician', 'team_leader']
-    if (!role || !validRoles.includes(role)) {
-      return c.json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` }, 400)
+    // Admin can assign any role except admin (admin role assignment is restricted)
+    const assignableRoles = VALID_ROLES.filter(r => r !== ROLES.ADMIN)
+    if (!role || !assignableRoles.includes(role as any)) {
+      return c.json({ error: `Invalid role. Must be one of: ${assignableRoles.join(', ')}` }, 400)
     }
 
     const { data, error } = await supabase
@@ -1161,7 +1168,7 @@ auth.patch('/profile', authMiddleware, async (c) => {
     const adminClient = getAdminClient()
     const { data: currentUserData, error: currentUserError } = await adminClient
       .from('users')
-      .select('role, first_name, last_name, email, password_hash, business_name, business_registration_number, gender, date_of_birth')
+      .select('role, first_name, last_name, email, password_hash, business_name, business_registration_number, gender, date_of_birth, profile_image_url')
       .eq('id', user.id)
       .single()
 
@@ -1227,7 +1234,7 @@ auth.patch('/profile', authMiddleware, async (c) => {
     // Handle business info updates - ONLY executives can edit business info
     if (business_name !== undefined || business_registration_number !== undefined) {
       // Only executives can update business info
-      if (currentUserData.role !== 'executive') {
+      if (currentUserData.role !== ROLES.EXECUTIVE) {
         return c.json({ 
           error: 'Only executives can edit business information. Business information is automatically inherited from your executive.' 
         }, 403)
@@ -1305,7 +1312,7 @@ auth.patch('/profile', authMiddleware, async (c) => {
       .from('users')
       .update(updates)
       .eq('id', user.id)
-      .select('id, email, first_name, last_name, full_name, role, business_name, business_registration_number, gender, date_of_birth')
+      .select('id, email, first_name, last_name, full_name, role, business_name, business_registration_number, gender, date_of_birth, profile_image_url')
       .single()
 
     if (updateError) {
@@ -1314,7 +1321,7 @@ auth.patch('/profile', authMiddleware, async (c) => {
     }
 
     // If executive updated business info, cascade update to all users under them
-    if (currentUserData.role === 'executive' && 
+    if (currentUserData.role === ROLES.EXECUTIVE && 
         (business_name !== undefined || business_registration_number !== undefined)) {
       
       const oldBusinessName = currentUserData.business_name || ''
@@ -1407,6 +1414,212 @@ auth.post('/verify-password', authMiddleware, async (c) => {
     return c.json({ verified: true })
   } catch (error: any) {
     console.error('[POST /auth/verify-password] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Upload profile image (authenticated users only)
+auth.post('/profile/image', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    // Get form data
+    const formData = await c.req.formData()
+    const imageFile = formData.get('image') as File | null
+
+    if (!imageFile) {
+      return c.json({ error: 'Image file is required' }, 400)
+    }
+
+    // Use centralized validation
+    const { validateImageFile, getSafeExtension } = await import('../utils/imageValidation.js')
+    const validation = validateImageFile(imageFile)
+    
+    if (!validation.valid) {
+      return c.json({ error: validation.error }, 400)
+    }
+
+    // Get safe file extension
+    const fileExtension = getSafeExtension(imageFile.name)
+
+    // Convert file to buffer
+    const arrayBuffer = await imageFile.arrayBuffer()
+    const buffer = Buffer.from(arrayBuffer)
+
+    // Upload to R2
+    const { uploadProfileImage, deleteProfileImage } = await import('../utils/r2Upload.js')
+    
+    // Get current profile image URL to delete old one
+    const adminClient = getAdminClient()
+    const { data: currentUser } = await adminClient
+      .from('users')
+      .select('profile_image_url')
+      .eq('id', user.id)
+      .single()
+
+    // Delete old image FIRST if it exists (before uploading new one)
+    if (currentUser?.profile_image_url) {
+      try {
+        console.log('[POST /auth/profile/image] Deleting old image:', currentUser.profile_image_url)
+        await deleteProfileImage(currentUser.profile_image_url)
+        console.log('[POST /auth/profile/image] Old image deleted successfully')
+      } catch (deleteError) {
+        // Don't fail the request if old image deletion fails
+        console.warn('[POST /auth/profile/image] Error deleting old image:', deleteError)
+      }
+    }
+
+    // Upload new image
+    let imageUrl: string
+    try {
+      imageUrl = await uploadProfileImage(buffer, user.id, fileExtension)
+      console.log('[POST /auth/profile/image] Image uploaded successfully:', imageUrl)
+    } catch (uploadError: any) {
+      console.error('[POST /auth/profile/image] R2 upload error:', uploadError)
+      console.error('[POST /auth/profile/image] Error details:', {
+        message: uploadError.message,
+        stack: uploadError.stack,
+        name: uploadError.name,
+      })
+      return c.json({ 
+        error: 'Failed to upload image to storage', 
+        details: uploadError.message || 'Unknown upload error' 
+      }, 500)
+    }
+
+    // Update user profile with new image URL
+    const { data: updatedUser, error: updateError } = await adminClient
+      .from('users')
+      .update({ profile_image_url: imageUrl })
+      .eq('id', user.id)
+      .select('id, profile_image_url')
+      .single()
+
+    if (updateError) {
+      console.error('[POST /auth/profile/image] Error updating profile:', updateError)
+      // Try to delete uploaded image if database update fails
+      try {
+        await deleteProfileImage(imageUrl)
+      } catch (deleteError) {
+        console.error('[POST /auth/profile/image] Error deleting uploaded image:', deleteError)
+      }
+      return c.json({ error: 'Failed to update profile', details: updateError.message }, 500)
+    }
+
+    return c.json({
+      message: 'Profile image uploaded successfully',
+      profile_image_url: imageUrl,
+    })
+  } catch (error: any) {
+    console.error('[POST /auth/profile/image] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Proxy profile image (serves images through backend while DNS propagates)
+// Performance: Implements aggressive caching with ETag support
+// Profile image proxy endpoint (centralized R2 fetch utility)
+// Security: Validates user exists and has profile image before serving
+auth.get('/profile/image/:userId', async (c) => {
+  try {
+    const userId = c.req.param('userId')
+    if (!userId) {
+      return c.json({ error: 'User ID is required' }, 400)
+    }
+
+    // Security: Validate UUID format to prevent injection
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    if (!uuidRegex.test(userId)) {
+      return c.json({ error: 'Invalid user ID format' }, 400)
+    }
+
+    // Get user's profile image URL from database
+    const adminClient = getAdminClient()
+    const { data: user, error: userError } = await adminClient
+      .from('users')
+      .select('profile_image_url')
+      .eq('id', userId)
+      .single()
+
+    if (userError || !user) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    if (!user.profile_image_url) {
+      return c.json({ error: 'No profile image found' }, 404)
+    }
+
+    // Use centralized R2 utility
+    const { extractR2Key, fetchImageFromR2, createImageProxyResponse } = await import('../utils/r2Upload.js')
+    
+    const key = extractR2Key(user.profile_image_url, 'profiles')
+    const ifNoneMatch = c.req.header('If-None-Match')
+    
+    // Fetch from R2 with security validation (only allow profiles/ prefix)
+    const result = await fetchImageFromR2(key, ['profiles/'], ifNoneMatch)
+    
+    return createImageProxyResponse(result)
+  } catch (error: any) {
+    console.error('[GET /auth/profile/image/:userId] Error:', error)
+    return c.json({ error: 'Failed to fetch image', details: error.message }, 500)
+  }
+})
+
+// Delete profile image (authenticated users only)
+auth.delete('/profile/image', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+    
+    // Get current profile image URL
+    const { data: currentUser, error: fetchError } = await adminClient
+      .from('users')
+      .select('profile_image_url')
+      .eq('id', user.id)
+      .single()
+
+    if (fetchError || !currentUser) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    if (!currentUser.profile_image_url) {
+      return c.json({ error: 'No profile image to delete' }, 400)
+    }
+
+    // Delete from R2
+    const { deleteProfileImage } = await import('../utils/r2Upload.js')
+    try {
+      await deleteProfileImage(currentUser.profile_image_url)
+    } catch (deleteError) {
+      // Don't fail if deletion fails - just log it
+      console.warn('[DELETE /auth/profile/image] Error deleting image from R2:', deleteError)
+    }
+
+    // Update user profile to remove image URL
+    const { data: updatedUser, error: updateError } = await adminClient
+      .from('users')
+      .update({ profile_image_url: null })
+      .eq('id', user.id)
+      .select('id, profile_image_url')
+      .single()
+
+    if (updateError) {
+      console.error('[DELETE /auth/profile/image] Error updating profile:', updateError)
+      return c.json({ error: 'Failed to update profile', details: updateError.message }, 500)
+    }
+
+    return c.json({
+      message: 'Profile image deleted successfully',
+    })
+  } catch (error: any) {
+    console.error('[DELETE /auth/profile/image] Error:', error)
     return c.json({ error: 'Internal server error', details: error.message }, 500)
   }
 })

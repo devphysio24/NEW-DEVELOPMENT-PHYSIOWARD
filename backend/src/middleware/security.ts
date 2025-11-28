@@ -37,10 +37,14 @@ export async function requestSizeLimit(c: Context, next: Next) {
   
   // Determine max size based on endpoint
   // Audio transcription endpoint needs up to 25MB (Whisper API limit)
-  // Add 5MB buffer for safety
+  // Profile image upload needs up to 5MB
+  // Add buffer for safety
   const isTranscriptionEndpoint = path.includes('/transcribe')
+  const isProfileImageEndpoint = path.includes('/profile/image')
   const maxSize = isTranscriptionEndpoint 
     ? 30 * 1024 * 1024 // 30MB for transcription
+    : isProfileImageEndpoint
+    ? 6 * 1024 * 1024 // 6MB for profile images (5MB + 1MB buffer)
     : 1024 * 1024 // 1MB for other endpoints
   
   if (contentLength && parseInt(contentLength) > maxSize) {

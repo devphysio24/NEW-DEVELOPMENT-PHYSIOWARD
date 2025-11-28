@@ -9,6 +9,8 @@ interface AnalyzeIncidentParams {
   location: string
   severity: 'low' | 'medium' | 'high' | 'critical'
   date: string
+  imageBase64?: string // Optional base64 encoded image for vision analysis
+  imageMimeType?: string // e.g., 'image/jpeg', 'image/png'
 }
 
 interface AnalysisResult {
@@ -34,8 +36,57 @@ interface TranscriptionAnalysisResult {
 }
 
 /**
+ * Calculate GPT-3.5-turbo cost from token usage
+ * Pricing (as of 2024): Input $0.50/1M tokens, Output $1.50/1M tokens
+ */
+function calculateGpt35TurboCost(usage: { prompt_tokens?: number; completion_tokens?: number } | undefined): {
+  cost: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+} {
+  const inputTokens = usage?.prompt_tokens || 0
+  const outputTokens = usage?.completion_tokens || 0
+  const inputCost = (inputTokens / 1_000_000) * 0.50
+  const outputCost = (outputTokens / 1_000_000) * 1.50
+  const totalCost = inputCost + outputCost
+
+  return {
+    cost: totalCost,
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  }
+}
+
+/**
+ * Calculate GPT-4o-mini cost from token usage (for vision)
+ * Pricing (as of 2024): Input $0.15/1K tokens, Output $0.60/1K tokens
+ */
+function calculateGpt4oMiniCost(usage: { prompt_tokens?: number; completion_tokens?: number } | undefined): {
+  cost: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+} {
+  const inputTokens = usage?.prompt_tokens || 0
+  const outputTokens = usage?.completion_tokens || 0
+  const inputCost = (inputTokens / 1_000) * 0.00015
+  const outputCost = (outputTokens / 1_000) * 0.0006
+  const totalCost = inputCost + outputCost
+
+  return {
+    cost: totalCost,
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  }
+}
+
+/**
  * Analyze incident report using OpenAI API
- * Optimized for cost: Uses GPT-3.5-turbo with concise prompts
+ * Supports both text-only and image+text analysis
+ * Uses GPT-4o-mini for vision (when image provided), GPT-3.5-turbo for text-only
  */
 export async function analyzeIncident(params: AnalyzeIncidentParams): Promise<AnalysisResult> {
   const apiKey = process.env.OPENAI_API_KEY
@@ -48,18 +99,20 @@ export async function analyzeIncident(params: AnalyzeIncidentParams): Promise<An
   const { OpenAI } = await import('openai')
   const openai = new OpenAI({ apiKey })
 
+  const hasImage = params.imageBase64 && params.imageMimeType
+
   // Optimized prompt - concise to minimize tokens
-  const systemPrompt = `You are an expert clinician specializing in workplace safety and occupational health. Analyze incident reports from a medical and clinical perspective. Provide professional clinical advice, assessment, and recommendations. Respond in JSON format:
+  const systemPrompt = `You are an expert clinician specializing in workplace safety and occupational health. Analyze incident reports from a medical and clinical perspective.${hasImage ? ' You will also analyze the provided image of the incident scene or injury.' : ''} Provide professional clinical advice, assessment, and recommendations. Respond in JSON format:
 {
-  "summary": "Brief 2-sentence clinical summary",
+  "summary": "Brief 2-sentence clinical summary${hasImage ? ' including observations from the image' : ''}",
   "riskLevel": "low|medium|high|critical",
   "recommendations": ["3-4 brief clinical recommendations"],
-  "severityAssessment": "One sentence clinical assessment of severity",
+  "severityAssessment": "One sentence clinical assessment of severity${hasImage ? ' based on both description and image' : ''}",
   "followUpActions": ["2-3 specific clinical follow-up actions"],
-  "advice": "Expert clinician advice and medical recommendations based on the description (2-3 sentences)"
+  "advice": "Expert clinician advice and medical recommendations (2-3 sentences)"${hasImage ? ',\n  "imageAnalysis": "Detailed analysis of what is visible in the image (2-3 sentences)"' : ''}
 }`
 
-  const userPrompt = `As an expert clinician, analyze this workplace incident report:
+  const userPromptText = `As an expert clinician, analyze this workplace incident report:
 
 Report Type: ${params.type === 'incident' ? 'Incident' : 'Near-Miss'}
 Severity: ${params.severity.toUpperCase()}
@@ -67,43 +120,115 @@ Date: ${params.date}
 Location: ${params.location}
 Description: ${params.description}
 
+${hasImage ? 'I have also attached a photo of the incident scene/injury. Please analyze the image and include your observations in your assessment.' : ''}
+
 Provide your clinical assessment, medical recommendations, and professional advice.`
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo', // Cost-effective model
-      messages: [
+    let completion: any
+    let costData: { cost: number; inputTokens: number; outputTokens: number; totalTokens: number }
+
+    if (hasImage) {
+      // Use GPT-4o-mini for vision analysis (supports images)
+      console.log('[analyzeIncident] Using GPT-4o-mini for image analysis')
+      
+      const messages: any[] = [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ],
-      temperature: 0.3, // Lower temperature for consistent, focused responses
-      max_tokens: 500, // Limit tokens to control cost
-      response_format: { type: 'json_object' } // Force JSON for structured response
-    })
+        { 
+          role: 'user', 
+          content: [
+            { type: 'text', text: userPromptText },
+            { 
+              type: 'image_url', 
+              image_url: { 
+                url: `data:${params.imageMimeType};base64,${params.imageBase64}`,
+                detail: 'low' // Use low detail to reduce cost
+              } 
+            }
+          ]
+        }
+      ]
+
+      completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini', // Vision-capable model
+        messages,
+        temperature: 0.3,
+        max_tokens: 700,
+      })
+
+      costData = calculateGpt4oMiniCost(completion.usage)
+    } else {
+      // Use GPT-3.5-turbo for text-only analysis (cost-effective)
+      completion = await openai.chat.completions.create({
+        model: 'gpt-3.5-turbo',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPromptText }
+        ],
+        temperature: 0.3,
+        max_tokens: 500,
+        response_format: { type: 'json_object' }
+      })
+
+      costData = calculateGpt35TurboCost(completion.usage)
+    }
 
     const content = completion.choices[0]?.message?.content
     if (!content) {
       throw new Error('No response from OpenAI')
     }
 
-    // Parse JSON response
-    const analysis = JSON.parse(content) as AnalysisResult
+    // Log cost for debugging
+    if (costData.cost > 0.0001) {
+      console.log(`[analyzeIncident] Cost: $${costData.cost.toFixed(6)} (${costData.inputTokens} input + ${costData.outputTokens} output tokens)${hasImage ? ' [with image]' : ''}`)
+    }
+
+    // Parse JSON response (handle potential markdown code blocks from vision model)
+    let jsonContent = content.trim()
+    if (jsonContent.startsWith('```json')) {
+      jsonContent = jsonContent.slice(7)
+    }
+    if (jsonContent.startsWith('```')) {
+      jsonContent = jsonContent.slice(3)
+    }
+    if (jsonContent.endsWith('```')) {
+      jsonContent = jsonContent.slice(0, -3)
+    }
+    jsonContent = jsonContent.trim()
+
+    const analysis = JSON.parse(jsonContent) as AnalysisResult & { imageAnalysis?: string }
+    
+    // Attach cost and image analysis to result
+    ;(analysis as any).estimatedCost = costData.cost
+    ;(analysis as any).tokenUsage = {
+      input: costData.inputTokens,
+      output: costData.outputTokens,
+      total: costData.totalTokens
+    }
+    ;(analysis as any).hasImageAnalysis = hasImage
 
     // Validate and sanitize response
-    return {
+    const result: AnalysisResult = {
       summary: analysis.summary || 'Analysis completed',
       riskLevel: ['low', 'medium', 'high', 'critical'].includes(analysis.riskLevel?.toLowerCase())
         ? analysis.riskLevel.toLowerCase() as 'low' | 'medium' | 'high' | 'critical'
         : params.severity,
       recommendations: Array.isArray(analysis.recommendations) 
-        ? analysis.recommendations.slice(0, 4) // Limit to 4 recommendations
+        ? analysis.recommendations.slice(0, 4)
         : ['Conduct clinical assessment with healthcare provider', 'Monitor for signs of injury or complications', 'Follow workplace safety protocols'],
       severityAssessment: analysis.severityAssessment || 'Clinical assessment pending - please review severity classification',
       followUpActions: Array.isArray(analysis.followUpActions)
-        ? analysis.followUpActions.slice(0, 3) // Limit to 3 actions
+        ? analysis.followUpActions.slice(0, 3)
         : ['Notify clinical supervisor', 'Document incident for medical review', 'Monitor worker condition'],
       advice: analysis.advice || 'As a clinician, I recommend immediate medical evaluation if any injuries are present. Ensure proper documentation for clinical follow-up.'
     }
+
+    // Add image analysis if available
+    if (analysis.imageAnalysis) {
+      ;(result as any).imageAnalysis = analysis.imageAnalysis
+    }
+
+    return result
   } catch (error: any) {
     console.error('[OpenAI Analysis] Error:', error)
     
@@ -252,7 +377,23 @@ Provide your clinical analysis, extract key medical information, and suggest rec
       throw new Error('No response from OpenAI')
     }
 
+    // Calculate cost from token usage
+    const costData = calculateGpt35TurboCost(completion.usage)
+    
+    // Log cost for debugging (only if significant)
+    if (costData.cost > 0.0001) {
+      console.log(`[analyzeTranscription] Cost: $${costData.cost.toFixed(6)} (${costData.inputTokens} input + ${costData.outputTokens} output tokens)`)
+    }
+
     const analysis = JSON.parse(content) as TranscriptionAnalysisResult
+    
+    // Attach cost to result for tracking
+    ;(analysis as any).estimatedCost = costData.cost
+    ;(analysis as any).tokenUsage = {
+      input: costData.inputTokens,
+      output: costData.outputTokens,
+      total: costData.totalTokens
+    }
 
     // Validate and sanitize response
     return {
