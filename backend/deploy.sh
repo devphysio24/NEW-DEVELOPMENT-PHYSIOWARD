@@ -22,7 +22,7 @@ fi
 
 # Install dependencies
 echo -e "${YELLOW}📦 Installing dependencies...${NC}"
-npm ci --production
+npm install --production --legacy-peer-deps
 
 # Build TypeScript
 echo -e "${YELLOW}🔨 Building TypeScript...${NC}"
