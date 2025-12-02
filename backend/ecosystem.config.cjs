@@ -1,6 +1,6 @@
 /**
  * PM2 Ecosystem Configuration
- * Run: pm2 start ecosystem.config.js
+ * Run: pm2 start ecosystem.config.cjs
  * Or: pm2 start npm --name "backend" -- start
  */
 

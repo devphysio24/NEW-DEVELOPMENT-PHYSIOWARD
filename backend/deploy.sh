@@ -44,7 +44,7 @@ pm2 delete workreadines-backend 2>/dev/null || true
 
 # Start with PM2
 echo -e "${YELLOW}▶️  Starting with PM2...${NC}"
-pm2 start ecosystem.config.js
+pm2 start ecosystem.config.cjs
 
 # Save PM2 configuration
 pm2 save
