@@ -6,6 +6,7 @@ import { getAdminClient } from '../utils/adminClient.js'
 import { formatDateString, parseDateString } from '../utils/dateTime.js'
 import { getTodayDateString, dateToDateString } from '../utils/dateUtils.js'
 import { calculateAge } from '../utils/ageUtils.js'
+import { ROLES } from '../constants/roles.js'
 
 const clinician = new Hono<{ Variables: AuthVariables }>()
 
@@ -247,7 +248,7 @@ const formatReturnDateForNotification = (dateStr: string | null | undefined): st
 
 
 // Get cases assigned to clinician (cases that need medical attention)
-clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/cases', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -272,7 +273,8 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
           email,
           first_name,
           last_name,
-          full_name
+          full_name,
+          profile_image_url
         ),
         teams!worker_exceptions_team_id_fkey(
           id,
@@ -473,6 +475,7 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
         workerName: formatUserName(user),
         workerEmail: user?.email || '',
         workerInitials: user?.first_name?.[0]?.toUpperCase() + user?.last_name?.[0]?.toUpperCase() || 'U',
+        workerProfileImageUrl: user?.profile_image_url || null,
         workerGender: user?.gender || null,
         workerAge: user?.date_of_birth ? calculateAge(user.date_of_birth) : null,
         teamId: incident.team_id,
@@ -604,7 +607,7 @@ clinician.get('/cases', authMiddleware, requireRole(['clinician']), async (c) =>
 })
 
 // Get single case detail by ID (OPTIMIZED: Direct lookup instead of fetching all cases)
-clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/cases/:id', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -628,7 +631,9 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
           email,
           first_name,
           last_name,
-          full_name
+          full_name,
+          gender,
+          date_of_birth
         ),
         teams!worker_exceptions_team_id_fkey(
           id,
@@ -653,7 +658,7 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
     const team = Array.isArray(caseData.teams) ? caseData.teams[0] : caseData.teams
     const userIds = [team?.supervisor_id, team?.team_leader_id].filter(Boolean)
     
-    const [teamMemberResult, usersResult, rehabPlanResult] = await Promise.all([
+    const [teamMemberResult, usersResult, rehabPlanResult, incidentResult] = await Promise.all([
       // Get phone number
       adminClient
         .from('team_members')
@@ -677,6 +682,18 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
         .eq('exception_id', caseId)
         .eq('clinician_id', user.id)
         .eq('status', 'active')
+        .maybeSingle(),
+      
+      // Get incident photo and AI analysis
+      // NOTE: Only worker-reported incidents have entries in the incidents table
+      // Supervisor-created exceptions do NOT have incident records, so this may return null
+      adminClient
+        .from('incidents')
+        .select('id, photo_url, ai_analysis_result, incident_date')
+        .eq('user_id', caseData.user_id)
+        .eq('incident_date', caseData.start_date)
+        .order('created_at', { ascending: false })
+        .limit(1)
         .maybeSingle()
     ])
 
@@ -711,6 +728,15 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
       priority = 'LOW'
     }
 
+    // Process incident photo URL (convert to proxy URL)
+    // NOTE: Only worker-reported incidents have photo/AI data
+    // Supervisor-created exceptions will have null values here (this is expected)
+    let incidentPhotoUrl = null
+    if (incidentResult.data?.photo_url && incidentResult.data?.id) {
+      // Use the incident ID to create the proxy URL
+      incidentPhotoUrl = `/api/worker/incident-photo/${incidentResult.data.id}`
+    }
+
     const formattedCase = {
       id: caseData.id,
       caseNumber: generateCaseNumber(caseData.id, caseData.created_at),
@@ -740,6 +766,9 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
       return_to_work_duty_type: caseData.return_to_work_duty_type || null,
       return_to_work_date: caseData.return_to_work_date || null,
       phone: teamMemberResult.data?.phone || null,
+      // Incident data
+      incidentPhotoUrl,
+      incidentAiAnalysis: incidentResult.data?.ai_analysis_result || null,
     }
 
     return c.json({ case: formattedCase }, 200, {
@@ -754,7 +783,7 @@ clinician.get('/cases/:id', authMiddleware, requireRole(['clinician']), async (c
 })
 
 // Get detailed daily progress for a specific rehabilitation plan
-clinician.get('/rehabilitation-plans/:id/progress', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/rehabilitation-plans/:id/progress', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -961,7 +990,7 @@ clinician.get('/rehabilitation-plans/:id/progress', authMiddleware, requireRole(
 })
 
 // Get rehabilitation plans
-clinician.get('/rehabilitation-plans', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/rehabilitation-plans', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1219,7 +1248,7 @@ clinician.get('/rehabilitation-plans', authMiddleware, requireRole(['clinician']
 })
 
 // Create rehabilitation plan
-clinician.post('/rehabilitation-plans', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.post('/rehabilitation-plans', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1386,7 +1415,7 @@ clinician.post('/rehabilitation-plans', authMiddleware, requireRole(['clinician'
 })
 
 // Update rehabilitation plan
-clinician.patch('/rehabilitation-plans/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.patch('/rehabilitation-plans/:id', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1480,7 +1509,7 @@ clinician.patch('/rehabilitation-plans/:id', authMiddleware, requireRole(['clini
 })
 
 // Update case status
-clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.patch('/cases/:id/status', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1738,13 +1767,13 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
           adminClient
               .from('users')
             .select('id')
-            .eq('role', 'whs_control_center'),
+            .eq('role', ROLES.WHS_CONTROL_CENTER),
           team?.supervisor_id
             ? adminClient
                 .from('users')
                 .select('id')
               .eq('id', team.supervisor_id)
-              .eq('role', 'supervisor')
+              .eq('role', ROLES.SUPERVISOR)
               .single()
             : Promise.resolve({ data: null }),
           team?.team_leader_id
@@ -1752,7 +1781,7 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
                 .from('users')
                 .select('id')
                 .eq('id', team.team_leader_id)
-                .eq('role', 'team_leader')
+                .eq('role', ROLES.TEAM_LEADER)
                 .single()
             : Promise.resolve({ data: null }),
         ])
@@ -1843,8 +1872,151 @@ clinician.patch('/cases/:id/status', authMiddleware, requireRole(['clinician']),
   }
 })
 
+// Update clinical notes for a case
+clinician.patch('/cases/:id/clinical-notes', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const caseId = c.req.param('id')
+    const { clinicalNotes } = await c.req.json()
+
+    // Validation
+    if (!caseId) {
+      return c.json({ error: 'Case ID is required' }, 400)
+    }
+
+    if (clinicalNotes === undefined || clinicalNotes === null) {
+      return c.json({ error: 'Clinical notes content is required' }, 400)
+    }
+
+    if (typeof clinicalNotes !== 'string') {
+      return c.json({ error: 'Clinical notes must be a string' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Verify case belongs to this clinician
+    const { data: caseData, error: caseError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, clinician_id, notes')
+      .eq('id', caseId)
+      .eq('clinician_id', user.id) // SECURITY: Only their assigned cases
+      .single()
+
+    if (caseError || !caseData) {
+      return c.json({ error: 'Case not found or not assigned to you' }, 404)
+    }
+
+    // Parse existing notes
+    const parsedNotes = parseIncidentNotes(caseData.notes)
+    const notesData = parsedNotes || {}
+
+    // Update clinical notes
+    notesData.clinical_notes = clinicalNotes
+    notesData.clinical_notes_updated_at = new Date().toISOString()
+    notesData.clinical_notes_updated_by = formatUserName(user)
+
+    // Update in database
+    const { error: updateError } = await adminClient
+      .from('worker_exceptions')
+      .update({
+        notes: JSON.stringify(notesData),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', caseId)
+
+    if (updateError) {
+      console.error('[PATCH /clinician/cases/:id/clinical-notes] Error:', updateError)
+      return c.json({ error: 'Failed to update clinical notes', details: updateError.message }, 500)
+    }
+
+    return c.json({ 
+      success: true, 
+      message: 'Clinical notes updated successfully',
+      updatedAt: notesData.clinical_notes_updated_at 
+    })
+
+  } catch (error: any) {
+    console.error('[PATCH /clinician/cases/:id/clinical-notes] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// Update AI analysis for an incident
+clinician.patch('/incidents/:id/ai-analysis', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const incidentId = c.req.param('id')
+    const { aiAnalysis } = await c.req.json()
+
+    // Validation
+    if (!incidentId) {
+      return c.json({ error: 'Incident ID is required' }, 400)
+    }
+
+    if (!aiAnalysis) {
+      return c.json({ error: 'AI analysis data is required' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // Get incident with case information
+    const { data: incidentData, error: incidentError } = await adminClient
+      .from('incidents')
+      .select('id, user_id, incident_date')
+      .eq('id', incidentId)
+      .single()
+
+    if (incidentError || !incidentData) {
+      return c.json({ error: 'Incident not found' }, 404)
+    }
+
+    // SECURITY: Verify the case for this incident is assigned to this clinician
+    const { data: caseData, error: caseError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, clinician_id')
+      .eq('user_id', incidentData.user_id)
+      .eq('start_date', incidentData.incident_date)
+      .eq('clinician_id', user.id) // SECURITY: Only their assigned cases
+      .maybeSingle()
+
+    if (caseError || !caseData) {
+      return c.json({ error: 'Case not found or not assigned to you' }, 404)
+    }
+
+    // Update AI analysis
+    const { error: updateError } = await adminClient
+      .from('incidents')
+      .update({
+        ai_analysis_result: aiAnalysis,
+      })
+      .eq('id', incidentId)
+
+    if (updateError) {
+      console.error('[PATCH /clinician/incidents/:id/ai-analysis] Error:', updateError)
+      return c.json({ error: 'Failed to update AI analysis', details: updateError.message }, 500)
+    }
+
+    return c.json({ 
+      success: true, 
+      message: 'AI analysis updated successfully' 
+    })
+
+  } catch (error: any) {
+    console.error('[PATCH /clinician/incidents/:id/ai-analysis] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
 // Update case notes
-clinician.post('/cases/:id/notes', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.post('/cases/:id/notes', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1922,7 +2094,7 @@ clinician.post('/cases/:id/notes', authMiddleware, requireRole(['clinician']), a
 })
 
 // Get notifications for clinician
-clinician.get('/notifications', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/notifications', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1936,7 +2108,7 @@ clinician.get('/notifications', authMiddleware, requireRole(['clinician']), asyn
 
     let query = adminClient
       .from('notifications')
-      .select('*')
+      .select('id, user_id, type, title, message, data, is_read, created_at, read_at')
       .eq('user_id', user.id)
       .order('created_at', { ascending: false })
       .limit(limit)
@@ -1973,7 +2145,7 @@ clinician.get('/notifications', authMiddleware, requireRole(['clinician']), asyn
 })
 
 // Mark notification as read
-clinician.patch('/notifications/:notificationId/read', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.patch('/notifications/:notificationId/read', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2022,7 +2194,7 @@ clinician.patch('/notifications/:notificationId/read', authMiddleware, requireRo
 })
 
 // Mark all notifications as read
-clinician.patch('/notifications/read-all', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.patch('/notifications/read-all', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2057,7 +2229,7 @@ clinician.patch('/notifications/read-all', authMiddleware, requireRole(['clinici
 })
 
 // Get appointments for clinician
-clinician.get('/appointments', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/appointments', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2086,7 +2258,8 @@ clinician.get('/appointments', authMiddleware, requireRole(['clinician']), async
             email,
             first_name,
             last_name,
-            full_name
+            full_name,
+            profile_image_url
           ),
           teams!worker_exceptions_team_id_fkey(
             id,
@@ -2099,7 +2272,8 @@ clinician.get('/appointments', authMiddleware, requireRole(['clinician']), async
           email,
           first_name,
           last_name,
-          full_name
+          full_name,
+          profile_image_url
         )
       `)
       .eq('clinician_id', user.id)
@@ -2179,6 +2353,7 @@ clinician.get('/appointments', authMiddleware, requireRole(['clinician']), async
         workerId: apt.worker_id,
         workerName: formatUserName(workerUser || worker),
         workerEmail: workerUser?.email || worker?.email || '',
+        workerProfileImageUrl: workerUser?.profile_image_url || worker?.profile_image_url || null,
         teamName: team?.name || '',
         siteLocation: team?.site_location || '',
         appointmentDate: apt.appointment_date,
@@ -2266,7 +2441,7 @@ clinician.get('/appointments', authMiddleware, requireRole(['clinician']), async
 })
 
 // Create appointment
-clinician.post('/appointments', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.post('/appointments', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2475,7 +2650,7 @@ clinician.post('/appointments', authMiddleware, requireRole(['clinician']), asyn
 })
 
 // Update appointment
-clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.patch('/appointments/:id', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2620,7 +2795,7 @@ clinician.patch('/appointments/:id', authMiddleware, requireRole(['clinician']),
 })
 
 // Delete appointment
-clinician.delete('/appointments/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.delete('/appointments/:id', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2667,7 +2842,7 @@ clinician.delete('/appointments/:id', authMiddleware, requireRole(['clinician'])
 })
 
 // Transcribe audio using Whisper API
-clinician.post('/transcribe', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.post('/transcribe', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2746,7 +2921,7 @@ clinician.post('/transcribe', authMiddleware, requireRole(['clinician']), async 
 })
 
 // Analyze transcription using OpenAI
-clinician.post('/analyze-transcription', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.post('/analyze-transcription', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2779,8 +2954,12 @@ clinician.post('/analyze-transcription', authMiddleware, requireRole(['clinician
       context: context?.trim() || undefined
     })
 
+    // Extract cost from analysis result if available
+    const analysisCost = (analysis as any).estimatedCost || 0
+
     return c.json({
       analysis,
+      analysisCost, // Return cost for frontend to track
       message: 'Transcription analyzed successfully'
     })
   } catch (error: any) {
@@ -2793,7 +2972,7 @@ clinician.post('/analyze-transcription', authMiddleware, requireRole(['clinician
 })
 
 // Save transcription to database
-clinician.post('/transcriptions', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.post('/transcriptions', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2807,7 +2986,8 @@ clinician.post('/transcriptions', authMiddleware, requireRole(['clinician']), as
       estimated_cost,
       audio_file_size_bytes,
       clinical_notes,
-      appointment_id
+      appointment_id,
+      analysis_cost // Optional: cost from analysis API call
     } = await c.req.json()
 
     // SECURITY: Validate transcription text
@@ -2828,6 +3008,17 @@ clinician.post('/transcriptions', authMiddleware, requireRole(['clinician']), as
     if (estimated_cost !== undefined && (typeof estimated_cost !== 'number' || estimated_cost < 0)) {
       return c.json({ error: 'Estimated cost must be a non-negative number' }, 400)
     }
+
+    if (analysis_cost !== undefined && (typeof analysis_cost !== 'number' || analysis_cost < 0)) {
+      return c.json({ error: 'Analysis cost must be a non-negative number' }, 400)
+    }
+
+    // Calculate accurate total cost: transcription cost + analysis cost
+    // Transcription cost is from Whisper API ($0.006 per minute)
+    // Analysis cost is from GPT-3.5-turbo (calculated from tokens)
+    const transcriptionCost = estimated_cost || 0
+    const analysisCostValue = analysis_cost || 0
+    const totalCost = transcriptionCost + analysisCostValue
 
     if (audio_file_size_bytes !== undefined && (typeof audio_file_size_bytes !== 'number' || audio_file_size_bytes < 0)) {
       return c.json({ error: 'Audio file size must be a non-negative number' }, 400)
@@ -2877,7 +3068,7 @@ clinician.post('/transcriptions', authMiddleware, requireRole(['clinician']), as
         transcription_text: transcription_text.trim(),
         analysis: analysis || null,
         recording_duration_seconds: recording_duration_seconds || null,
-        estimated_cost: estimated_cost || null,
+        estimated_cost: totalCost >= 0 ? totalCost : null, // Total cost including transcription + analysis (allow 0 for tracking)
         audio_file_size_bytes: audio_file_size_bytes || null,
         clinical_notes: sanitizedClinicalNotes,
         appointment_id: appointment_id || null,
@@ -2910,7 +3101,7 @@ clinician.post('/transcriptions', authMiddleware, requireRole(['clinician']), as
 })
 
 // Get transcriptions history
-clinician.get('/transcriptions', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/transcriptions', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2935,7 +3126,7 @@ clinician.get('/transcriptions', authMiddleware, requireRole(['clinician']), asy
     // Get transcriptions for this clinician (ordered by most recent first)
     const { data: transcriptions, error: fetchError } = await adminClient
       .from('transcriptions')
-      .select('*')
+      .select('id, clinician_id, appointment_id, transcription_text, analysis, clinical_notes, recording_duration_seconds, estimated_cost, audio_file_size_bytes, created_at, updated_at')
       .eq('clinician_id', user.id) // SECURITY: Filter by logged-in clinician's ID
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1)
@@ -2973,7 +3164,7 @@ clinician.get('/transcriptions', authMiddleware, requireRole(['clinician']), asy
 })
 
 // Get single transcription by ID
-clinician.get('/transcriptions/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.get('/transcriptions/:id', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -2993,7 +3184,7 @@ clinician.get('/transcriptions/:id', authMiddleware, requireRole(['clinician']),
     // Get transcription (only if owned by this clinician)
     const { data: transcription, error: fetchError } = await adminClient
       .from('transcriptions')
-      .select('*')
+      .select('id, clinician_id, appointment_id, transcription_text, analysis, clinical_notes, recording_duration_seconds, estimated_cost, audio_file_size_bytes, created_at, updated_at')
       .eq('id', transcriptionId)
       .eq('clinician_id', user.id) // SECURITY: Only allow access if owned by logged-in clinician
       .single()
@@ -3020,7 +3211,7 @@ clinician.get('/transcriptions/:id', authMiddleware, requireRole(['clinician']),
 })
 
 // Delete transcription
-clinician.delete('/transcriptions/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.delete('/transcriptions/:id', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -3077,7 +3268,7 @@ clinician.delete('/transcriptions/:id', authMiddleware, requireRole(['clinician'
 })
 
 // Update transcription (analysis and clinical notes)
-clinician.put('/transcriptions/:id', authMiddleware, requireRole(['clinician']), async (c) => {
+clinician.put('/transcriptions/:id', authMiddleware, requireRole([ROLES.CLINICIAN]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -3101,12 +3292,14 @@ clinician.put('/transcriptions/:id', authMiddleware, requireRole(['clinician']),
       return c.json({ error: 'Invalid JSON in request body' }, 400)
     }
 
-    const { analysis, clinical_notes } = requestBody
+    const { analysis, clinical_notes, analysis_cost } = requestBody
 
     // SECURITY: Validate analysis object structure (deep validation)
-    const analysisValidation = validateAnalysisObject(analysis)
-    if (!analysisValidation.valid) {
-      return c.json({ error: analysisValidation.error }, 400)
+    if (analysis !== undefined) {
+      const analysisValidation = validateAnalysisObject(analysis)
+      if (!analysisValidation.valid) {
+        return c.json({ error: analysisValidation.error }, 400)
+      }
     }
 
     // SECURITY: Validate clinical notes if provided
@@ -3119,15 +3312,21 @@ clinician.put('/transcriptions/:id', authMiddleware, requireRole(['clinician']),
       return c.json({ error: 'Clinical notes too long. Maximum length is 10,000 characters' }, 400)
     }
 
+    // SECURITY: Validate analysis_cost if provided
+    if (analysis_cost !== undefined && (typeof analysis_cost !== 'number' || analysis_cost < 0)) {
+      return c.json({ error: 'Analysis cost must be a non-negative number' }, 400)
+    }
+
     // SECURITY: Validate and sanitize clinical notes
     const sanitizedClinicalNotes = clinical_notes ? sanitizeString(clinical_notes, 10000) : null
 
     const adminClient = getAdminClient()
 
     // SECURITY: Verify transcription exists and is owned by logged-in clinician
+    // Also get existing cost and duration for cost recalculation
     const { data: existingTranscription, error: checkError } = await adminClient
       .from('transcriptions')
-      .select('clinician_id')
+      .select('clinician_id, estimated_cost, recording_duration_seconds')
       .eq('id', transcriptionId)
       .single()
 
@@ -3153,7 +3352,22 @@ clinician.put('/transcriptions/:id', authMiddleware, requireRole(['clinician']),
     
     if (analysis !== undefined) {
       updateData.analysis = analysis
+      
+      // Update estimated_cost when analysis is added/updated
+      // Calculate new total cost: existing transcription cost + new analysis cost
+      const existingCost = existingTranscription.estimated_cost || 0
+      const newAnalysisCost = analysis_cost || 0
+      
+      // If existing cost is 0 or null, estimate from duration (Whisper cost)
+      let transcriptionCost = existingCost
+      if (!existingCost && existingTranscription.recording_duration_seconds) {
+        transcriptionCost = (existingTranscription.recording_duration_seconds / 60) * 0.006 // Whisper cost per minute
+      }
+      
+      const newTotalCost = transcriptionCost + newAnalysisCost
+      updateData.estimated_cost = newTotalCost >= 0 ? newTotalCost : null
     }
+    
     if (clinical_notes !== undefined) {
       updateData.clinical_notes = sanitizedClinicalNotes
     }

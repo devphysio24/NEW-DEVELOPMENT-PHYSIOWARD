@@ -1,0 +1,569 @@
+---
+alwaysApply: false
+---
+## 🗂️ Route Structure & Organization
+
+### Route File Naming
+
+**✅ DO:**
+- Use **singular, lowercase** names: `worker.ts`, `clinician.ts`, `supervisor.ts`
+- Match **role name** or **resource name**: `teams.ts`, `checkins.ts`, `schedules.ts`
+- One route file per **role** or **resource domain**
+
+### Route Handler Structure
+
+**✅ Standard Route Handler Pattern:**
+
+```typescript
+// 1. Import statements (grouped by category)
+import { Hono } from 'hono'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { getTodayDateString } from '../utils/dateUtils.js'
+import { validateEmail } from '../utils/validationUtils.js'
+
+// 2. Create Hono instance with types
+const routeName = new Hono<{ Variables: AuthVariables }>()
+
+// 3. Route handlers (grouped by resource/action)
+routeName.get('/endpoint', authMiddleware, requireRole(['role']), async (c) => {
+  try {
+    // 4. Authentication check
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    // 5. Get admin client
+    const adminClient = getAdminClient()
+
+    // 6. Input validation
+    const { param1, param2 } = await c.req.json()
+    if (!param1) {
+      return c.json({ error: 'param1 is required' }, 400)
+    }
+
+    // 7. Business logic
+    const { data, error } = await adminClient.from('table').select('*').eq('id', param1)
+
+    if (error) {
+      return c.json({ error: 'Failed to fetch data', details: error.message }, 500)
+    }
+
+    // 8. Success response
+    return c.json({ success: true, data })
+
+  } catch (error: any) {
+    console.error('[GET /route/endpoint] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+// 9. Export route
+export default routeName
+```
+
+---
+
+## 🗄️ Database Query Patterns
+
+### Admin Client Usage
+
+**✅ ALWAYS use `getAdminClient()` for database operations:**
+
+```typescript
+// ✅ GOOD: Use utility
+import { getAdminClient } from '../utils/adminClient.js'
+
+const adminClient = getAdminClient()
+const { data, error } = await adminClient.from('table').select('*')
+```
+
+**❌ DON'T:**
+- Create new Supabase client instances
+- Use user client for admin operations
+- Duplicate admin client creation logic
+
+### Query Error Handling
+
+**✅ Standard Pattern:**
+
+```typescript
+const { data, error } = await adminClient
+  .from('table')
+  .select('*')
+  .eq('id', id)
+  .maybeSingle()  // Use maybeSingle() if expecting 0 or 1 result
+
+if (error) {
+  console.error('[Operation] Database error:', error)
+  return c.json({ 
+    error: 'Failed to fetch data', 
+    details: error.message 
+  }, 500)
+}
+
+if (!data) {
+  return c.json({ error: 'Resource not found' }, 404)
+}
+```
+
+---
+
+## ⚠️ Error Handling Standards
+
+### Error Response Format
+
+**✅ ALWAYS use consistent error format:**
+
+```typescript
+// Standard error response
+{
+  success: false,
+  error: string,        // User-friendly message
+  details?: string      // Optional: Technical details (only in development)
+}
+```
+
+### HTTP Status Codes
+
+**✅ Use appropriate status codes:**
+
+| Status Code | Use Case | Example |
+|------------|----------|---------|
+| `400` | Bad Request | Missing required fields, invalid format |
+| `401` | Unauthorized | No token, invalid token |
+| `403` | Forbidden | Insufficient permissions |
+| `404` | Not Found | Resource doesn't exist |
+| `409` | Conflict | Duplicate resource |
+| `500` | Internal Server Error | Database errors, unexpected errors |
+| `503` | Service Unavailable | External service down |
+
+---
+
+## ✅ Validation Patterns
+
+### Input Validation
+
+**✅ ALWAYS validate user input:**
+
+```typescript
+// ✅ GOOD: Use validation utilities
+import { validateEmail, validateStringInput, validatePassword } from '../utils/validationUtils.js'
+
+const emailValidation = validateEmail(body.email)
+if (!emailValidation.valid) {
+  return c.json({ error: emailValidation.error }, 400)
+}
+
+const passwordValidation = validatePassword(body.password)
+if (!passwordValidation.valid) {
+  return c.json({ error: passwordValidation.error }, 400)
+}
+```
+
+### Available Validation Utilities
+
+**Use these utilities from `backend/src/utils/validationUtils.ts`:**
+
+```typescript
+// ID validation
+isValidId(id, maxLength?)           // Returns boolean
+validateTeamId(teamId)              // Returns { valid, error? }
+
+// String validation
+validateStringInput(input, maxLength, fieldName)  // Returns { valid, value?, error? }
+
+// Email validation
+validateEmail(email)                // Returns { valid, value?, error? }
+
+// Password validation
+validatePassword(password)          // Returns { valid, error? }
+```
+
+---
+
+## 📤 Response Formatting
+
+### Success Response Format
+
+**✅ Standard success response:**
+
+```typescript
+// Single resource
+return c.json({ 
+  success: true, 
+  data: resource 
+})
+
+// List of resources
+return c.json({ 
+  success: true, 
+  data: resources,
+  count: resources.length
+})
+
+// Paginated response
+return c.json({
+  success: true,
+  data: items,
+  pagination: {
+    cursor: encodeCursor({ offset: nextOffset }),
+    hasMore: items.length === limit
+  }
+})
+```
+
+---
+
+## 🛠️ Utility Usage Rules
+
+### When to Use Utilities
+
+**✅ ALWAYS use utilities for:**
+
+1. **Date operations** → `backend/src/utils/dateUtils.ts`
+   ```typescript
+   import { getTodayDateString, getStartOfWeekDateString } from '../utils/dateUtils.js'
+   ```
+
+2. **Date/time formatting** → `backend/src/utils/dateTime.ts`
+   ```typescript
+   import { formatDateString, normalizeDate } from '../utils/dateTime.js'
+   ```
+
+3. **Case status operations** → `backend/src/utils/caseStatus.ts`
+   ```typescript
+   import { getCaseStatusFromNotes, mapCaseStatusToDisplay } from '../utils/caseStatus.js'
+   ```
+
+4. **Notes parsing** → `backend/src/utils/notesParser.ts`
+   ```typescript
+   import { parseIncidentNotes, extractReturnToWorkData } from '../utils/notesParser.js'
+   ```
+
+5. **User formatting** → `backend/src/utils/userUtils.ts`
+   ```typescript
+   import { formatUserFullName, getUserInitials } from '../utils/userUtils.js'
+   ```
+
+6. **Exception operations** → `backend/src/utils/exceptionUtils.ts`
+   ```typescript
+   import { isExceptionActive, getWorkersWithActiveExceptions } from '../utils/exceptionUtils.js'
+   ```
+
+7. **Validation** → `backend/src/utils/validationUtils.ts`
+   ```typescript
+   import { validateEmail, validatePassword, validateStringInput } from '../utils/validationUtils.js'
+   ```
+
+8. **Pagination** → `backend/src/utils/cursorPagination.ts`
+   ```typescript
+   import { encodeCursor, decodeCursor } from '../utils/cursorPagination.js'
+   ```
+
+### Before Creating New Utility
+
+**✅ Checklist:**
+- [ ] **Search** existing utilities first
+- [ ] **Check** if logic is used in 2+ places
+- [ ] **Verify** it's not route-specific
+- [ ] **Determine** appropriate file (or create new)
+- [ ] **Write** JSDoc comments
+- [ ] **Export** with proper TypeScript types
+
+---
+
+## 📁 Code Organization
+
+### Import Order
+
+**✅ Organize imports in this order:**
+
+```typescript
+// 1. Framework imports
+import { Hono } from 'hono'
+
+// 2. Third-party libraries
+import bcrypt from 'bcrypt'
+
+// 3. Internal middleware
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+
+// 4. Internal utilities (group by category)
+import { getAdminClient } from '../utils/adminClient.js'
+import { getTodayDateString } from '../utils/dateUtils.js'
+import { validateEmail } from '../utils/validationUtils.js'
+import { formatUserFullName } from '../utils/userUtils.js'
+```
+
+---
+
+## 🔒 Security Best Practices
+
+### Input Sanitization
+
+**✅ ALWAYS sanitize user input:**
+
+```typescript
+// ✅ GOOD: Use validation utilities (they sanitize)
+const emailValidation = validateEmail(body.email)
+if (!emailValidation.valid) {
+  return c.json({ error: emailValidation.error }, 400)
+}
+const sanitizedEmail = emailValidation.value  // Already trimmed and lowercased
+```
+
+### Authorization Checks
+
+**✅ ALWAYS check authorization:**
+
+```typescript
+// ✅ GOOD: Use middleware + additional checks
+routeName.get('/endpoint', 
+  authMiddleware, 
+  requireRole(['supervisor']), 
+  async (c) => {
+    const user = c.get('user')
+    
+    // Additional resource-level authorization if needed
+    const { data: resource } = await adminClient
+      .from('resources')
+      .select('*')
+      .eq('id', resourceId)
+      .eq('supervisor_id', user.id)  // Ensure user owns resource
+      .maybeSingle()
+    
+    if (!resource) {
+      return c.json({ error: 'Resource not found or access denied' }, 404)
+    }
+  }
+)
+```
+
+---
+
+## ✅ Before Creating New Code Checklist
+
+### Before Writing a Route Handler
+
+- [ ] **Check** if similar endpoint exists
+- [ ] **Verify** route file location (correct role/resource file)
+- [ ] **Plan** authentication/authorization requirements
+- [ ] **Identify** required utilities (date, validation, etc.)
+- [ ] **Design** request/response format
+- [ ] **Consider** error cases and edge cases
+
+### Before Creating a Utility
+
+- [ ] **Search** existing utilities for similar functionality
+- [ ] **Verify** logic will be used in 2+ places
+- [ ] **Check** if it's route-specific (should stay in route file)
+- [ ] **Determine** appropriate utility file (or create new)
+- [ ] **Write** JSDoc comments with examples
+- [ ] **Add** TypeScript types for parameters and return values
+
+### Code Review Checklist
+
+- [ ] **No duplication**: Logic used in 2+ places is in utility
+- [ ] **Proper imports**: Organized and using utilities
+- [ ] **Error handling**: Consistent error format and status codes
+- [ ] **Validation**: All user input validated
+- [ ] **Security**: No sensitive data exposed, proper authorization
+- [ ] **Type safety**: Proper TypeScript types
+- [ ] **Documentation**: JSDoc comments for complex logic
+- [ ] **Response format**: Consistent success/error format
+
+---
+
+## 📚 Common Patterns & Examples
+
+### ✅ Good Pattern: Complete Route Handler
+
+```typescript
+import { Hono } from 'hono'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getAdminClient } from '../utils/adminClient.js'
+import { getTodayDateString } from '../utils/dateUtils.js'
+import { validateEmail } from '../utils/validationUtils.js'
+import { formatUserFullName } from '../utils/userUtils.js'
+
+const example = new Hono<{ Variables: AuthVariables }>()
+
+example.get('/users/:id', authMiddleware, requireRole(['admin']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const userId = c.req.param('id')
+    if (!userId) {
+      return c.json({ error: 'User ID is required' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+    const { data, error } = await adminClient
+      .from('users')
+      .select('id, email, full_name, role, created_at')
+      .eq('id', userId)
+      .maybeSingle()
+
+    if (error) {
+      return c.json({ error: 'Failed to fetch user', details: error.message }, 500)
+    }
+
+    if (!data) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    return c.json({ 
+      success: true, 
+      data: {
+        ...data,
+        fullName: formatUserFullName(data)
+      }
+    })
+
+  } catch (error: any) {
+    console.error('[GET /example/users/:id] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+export default example
+```
+
+### ❌ Bad Pattern: Duplicated Logic
+
+```typescript
+// ❌ BAD: Duplicated date calculation
+const today = new Date().toISOString().split('T')[0]
+
+// ✅ GOOD: Use utility
+import { getTodayDateString } from '../utils/dateUtils.js'
+const today = getTodayDateString()
+```
+
+### ❌ Bad Pattern: Missing Validation
+
+```typescript
+// ❌ BAD: No validation
+const { email, password } = await c.req.json()
+const { data } = await adminClient.from('users').insert({ email, password })
+
+// ✅ GOOD: Validate first
+const emailValidation = validateEmail(body.email)
+if (!emailValidation.valid) {
+  return c.json({ error: emailValidation.error }, 400)
+}
+```
+
+---
+
+## 🎯 Quick Reference
+
+### Standard Route Template
+
+```typescript
+import { Hono } from 'hono'
+import { authMiddleware, requireRole, AuthVariables } from '../middleware/auth.js'
+import { getAdminClient } from '../utils/adminClient.js'
+
+const routeName = new Hono<{ Variables: AuthVariables }>()
+
+routeName.get('/endpoint', authMiddleware, requireRole(['role']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+    
+    // Add route logic here
+    
+    return c.json({ success: true, data: result })
+
+  } catch (error: any) {
+    console.error('[GET /route/endpoint] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
+export default routeName
+```
+
+### Utility Import Cheat Sheet
+
+```typescript
+// Date operations
+import { getTodayDateString, getStartOfWeekDateString } from '../utils/dateUtils.js'
+
+// Date formatting
+import { formatDateString, normalizeDate } from '../utils/dateTime.js'
+
+// Case status
+import { getCaseStatusFromNotes, mapCaseStatusToDisplay } from '../utils/caseStatus.js'
+
+// Notes parsing
+import { parseIncidentNotes, extractReturnToWorkData } from '../utils/notesParser.js'
+
+// User formatting
+import { formatUserFullName, getUserInitials } from '../utils/userUtils.js'
+
+// Validation
+import { validateEmail, validatePassword, validateStringInput } from '../utils/validationUtils.js'
+
+// Exceptions
+import { isExceptionActive, getWorkersWithActiveExceptions } from '../utils/exceptionUtils.js'
+
+// Pagination
+import { encodeCursor, decodeCursor } from '../utils/cursorPagination.js'
+
+// Database
+import { getAdminClient } from '../utils/adminClient.js'
+```
+
+---
+
+## 📝 Notes
+
+- **This document is living**: Update as patterns evolve
+- **Enforce in PRs**: Use this document as reference during code reviews
+- **Refactor gradually**: Don't need to refactor everything at once, but follow rules for new code
+- **Ask questions**: If unsure about a pattern, check existing code or ask team
+
+---
+
+**Questions or suggestions?** Update this document and share with the team.
+```
+
+## Summary
+
+Nakagawa na ng `BACKEND_RULES.md` na backend-specific rules document. Kasama dito:
+
+### Key sections:
+1. Route structure — standard pattern para sa route handlers
+2. Database query patterns — paano gamitin ang `getAdminClient()`
+3. Error handling — consistent error format at status codes
+4. Validation patterns — gamitin ang validation utilities
+5. Response formatting — standard response structure
+6. Utility usage rules — kung kailan at paano gamitin ang utilities
+7. Code organization — import order at structure
+8. Security best practices — input sanitization at authorization
+9. Checklists — bago gumawa ng bagong code
+10. Examples — good vs bad patterns
+
+### Main rules:
+- Gamitin ang `getAdminClient()` para sa database operations
+- Gamitin ang validation utilities (`validateEmail`, `validatePassword`, etc.)
+- Gamitin ang date utilities (`getTodayDateString`, etc.)
+- Consistent error format: `{ success: false, error: string }`
+- Consistent success format: `{ success: true, data: T }`
+- Iwasan ang duplication — search muna bago gumawa ng bagong utility
+- Standard route handler structure
+
+I-save mo ito bilang `BACKEND_RULES.md` sa root ng project. Gamitin ito bilang reference kapag gumagawa ng bagong backend code para maging consistent at reusable.
+
+Gusto mo bang i-update o dagdagan ang ilang section?

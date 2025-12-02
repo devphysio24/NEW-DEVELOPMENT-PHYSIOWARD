@@ -1,0 +1,669 @@
+# System Reusability Rules & Guidelines
+
+**Purpose:** This document outlines rules and best practices to ensure code reusability between backend and frontend, preventing duplication and maintaining consistency across the codebase.
+
+**Last Updated:** 2024
+
+---
+
+## 📋 Table of Contents
+
+1. [Core Principles](#core-principles)
+2. [Utility Organization Rules](#utility-organization-rules)
+3. [Frontend vs Backend Separation](#frontend-vs-backend-separation)
+4. [Naming Conventions](#naming-conventions)
+5. [Code Duplication Prevention](#code-duplication-prevention)
+6. [Shared Logic Guidelines](#shared-logic-guidelines)
+7. [API & Data Contract Rules](#api--data-contract-rules)
+8. [Validation & Security Rules](#validation--security-rules)
+9. [Date & Time Handling](#date--time-handling)
+10. [Error Handling Standards](#error-handling-standards)
+11. [Type Definitions & Interfaces](#type-definitions--interfaces)
+12. [Migration & Refactoring Checklist](#migration--refactoring-checklist)
+
+---
+
+## 🎯 Core Principles
+
+### 1. **DRY (Don't Repeat Yourself)**
+- ✅ **DO:** Create reusable utilities for logic used in 2+ places
+- ❌ **DON'T:** Copy-paste code between files
+- ✅ **DO:** Extract common patterns into shared functions
+
+### 2. **Single Source of Truth**
+- ✅ **DO:** Define constants, types, and enums in one place
+- ❌ **DON'T:** Duplicate type definitions or constants
+- ✅ **DO:** Import from centralized locations
+
+### 3. **Separation of Concerns**
+- ✅ **DO:** Keep business logic separate from UI logic
+- ✅ **DO:** Keep backend-specific logic in backend
+- ✅ **DO:** Keep frontend-specific logic in frontend
+- ✅ **DO:** Share pure utility functions that work in both contexts
+
+### 4. **Consistency First**
+- ✅ **DO:** Use the same naming conventions across frontend/backend
+- ✅ **DO:** Use the same data formats and structures
+- ✅ **DO:** Follow the same validation rules
+
+---
+
+## 📁 Utility Organization Rules
+
+### Directory Structure
+
+```
+backend/src/utils/          # Backend-only utilities
+frontend/src/utils/         # Frontend-only utilities
+shared/                     # (Optional) Shared utilities if using monorepo
+```
+
+### When to Create a Utility File
+
+**✅ CREATE a utility file when:**
+- Logic is used in **2+ different files**
+- Logic is **pure** (no side effects, same input = same output)
+- Logic is **testable** independently
+- Logic represents a **single responsibility**
+
+**❌ DON'T create a utility file when:**
+- Logic is used only once
+- Logic is tightly coupled to a specific component/route
+- Logic requires framework-specific dependencies (React hooks, Hono context, etc.)
+
+### Utility File Naming
+
+- Use **camelCase** for file names: `dateUtils.ts`, `caseStatus.ts`
+- Use **descriptive names**: `userUtils.ts` not `utils.ts`
+- Group related functions: All date functions in `dateUtils.ts`
+- Use **singular** for single-purpose: `exceptionUtils.ts` (handles exceptions)
+
+---
+
+## 🔀 Frontend vs Backend Separation
+
+### Backend-Only Utilities (`backend/src/utils/`)
+
+**Use for:**
+- Database operations (`adminClient.ts`)
+- Server-side validation (`validationUtils.ts`)
+- Authentication/authorization helpers
+- Server-side data transformation
+- Cursor pagination (`cursorPagination.ts`)
+- OpenAI integration (`openai.ts`)
+
+**Example:**
+```typescript
+// backend/src/utils/adminClient.ts
+export function getAdminClient() {
+  // Server-side only, uses Supabase admin client
+}
+```
+
+### Frontend-Only Utilities (`frontend/src/utils/`)
+
+**Use for:**
+- UI formatting (`dateTime.ts` - display formatting)
+- React-specific helpers (`avatarUtils.ts`)
+- Client-side API helpers (`apiHelpers.ts`)
+- Query building for API calls (`queryBuilder.ts`)
+- Frontend validation (lightweight, UX-focused)
+
+**Example:**
+```typescript
+// frontend/src/utils/dateTime.ts
+export function formatDateDisplay(dateStr: string): string {
+  // Frontend-only: UI formatting for display
+}
+```
+
+### Shared Logic (Similar but Separate)
+
+**When logic is similar but needs different implementations:**
+
+**✅ DO:**
+- Keep separate implementations if they serve different purposes
+- Use same naming conventions
+- Document the relationship
+
+**Example:**
+```typescript
+// backend/src/utils/dateUtils.ts
+export function getTodayDateString(): string {
+  // Backend: For database queries
+}
+
+// frontend/src/utils/dateUtils.ts  
+export function getTodayDateString(): string {
+  // Frontend: For form defaults, same logic but separate file
+}
+```
+
+**❌ DON'T:**
+- Duplicate complex business logic
+- Create different validation rules for same data
+- Use different date formats for same purpose
+
+---
+
+## 📝 Naming Conventions
+
+### Function Naming
+
+**✅ DO:**
+- Use **verb + noun**: `getUserById()`, `formatDate()`, `validateEmail()`
+- Use **camelCase**: `getTodayDateString()`
+- Be **descriptive**: `getStartOfWeekDateString()` not `getWeekStart()`
+- Use **consistent prefixes**:
+  - `get*` - Retrieves data
+  - `format*` - Formats for display
+  - `validate*` - Validates input
+  - `parse*` - Parses/transforms data
+  - `is*` / `has*` - Boolean checks
+  - `create*` - Creates new data
+  - `update*` - Updates existing data
+
+**❌ DON'T:**
+- Use abbreviations: `getUsr()` ❌ → `getUser()` ✅
+- Use vague names: `process()` ❌ → `parseNotes()` ✅
+- Mix naming styles in same file
+
+### Constant Naming
+
+**✅ DO:**
+- Use **UPPER_SNAKE_CASE**: `VALID_CASE_STATUSES`, `STATUS_DISPLAY_MAP`
+- Group related constants in same file
+- Export from centralized location
+
+**Example:**
+```typescript
+// backend/src/utils/caseStatus.ts
+export const VALID_CASE_STATUSES = ['new', 'triaged', ...] as const
+export const STATUS_DISPLAY_MAP: Record<CaseStatus, string> = { ... }
+```
+
+### Type/Interface Naming
+
+**✅ DO:**
+- Use **PascalCase**: `CaseStatus`, `ParsedNotes`, `UserRole`
+- Use **descriptive names**: `ExecutiveBusinessInfo` not `Info`
+- Prefix interfaces with `I` only if team convention requires it (not recommended)
+
+---
+
+## 🚫 Code Duplication Prevention
+
+### Checklist Before Writing New Code
+
+**Before writing a function, ask:**
+
+1. ✅ **Does this logic exist elsewhere?**
+   - Search codebase for similar functions
+   - Check both `frontend/src/utils/` and `backend/src/utils/`
+
+2. ✅ **Can I reuse an existing utility?**
+   - Check if existing function can be extended
+   - Check if existing function needs a parameter added
+
+3. ✅ **Should this be a utility?**
+   - Used in 2+ places? → Create utility
+   - Used once? → Keep inline or in component/route
+
+4. ✅ **Is this the right location?**
+   - Backend-specific? → `backend/src/utils/`
+   - Frontend-specific? → `frontend/src/utils/`
+   - Similar logic needed in both? → Create separate but consistent implementations
+
+### Common Duplication Patterns to Avoid
+
+#### ❌ Pattern 1: Duplicate Date Formatting
+```typescript
+// ❌ BAD: Duplicated in multiple files
+const today = new Date().toISOString().split('T')[0]
+
+// ✅ GOOD: Use utility
+import { getTodayDateString } from '../utils/dateUtils'
+const today = getTodayDateString()
+```
+
+#### ❌ Pattern 2: Duplicate Validation
+```typescript
+// ❌ BAD: Same validation in multiple routes
+if (!email || !email.includes('@')) {
+  return { error: 'Invalid email' }
+}
+
+// ✅ GOOD: Use validation utility
+import { validateEmail } from '../utils/validationUtils'
+const emailError = validateEmail(email)
+```
+
+#### ❌ Pattern 3: Duplicate Status Mapping
+```typescript
+// ❌ BAD: Status mapping duplicated
+const statusMap = {
+  'new': 'NEW CASE',
+  'triaged': 'TRIAGED',
+  // ...
+}
+
+// ✅ GOOD: Use centralized constant
+import { STATUS_DISPLAY_MAP } from '../utils/caseStatus'
+```
+
+---
+
+## 🔄 Shared Logic Guidelines
+
+### When to Share Logic
+
+**✅ Share (Create similar implementations):**
+- **Constants**: Status values, display labels, color schemes
+- **Type definitions**: Interfaces, enums (if using shared types package)
+- **Validation rules**: Same rules should apply in both frontend and backend
+- **Business logic**: Calculations, transformations that are framework-agnostic
+
+**Example - Status Constants:**
+```typescript
+// backend/src/utils/caseStatus.ts
+export const VALID_CASE_STATUSES = ['new', 'triaged', ...] as const
+export const STATUS_DISPLAY_MAP: Record<CaseStatus, string> = {
+  'new': 'NEW CASE',
+  // ...
+}
+
+// frontend/src/utils/caseStatus.ts
+// ✅ GOOD: Same constants, but frontend adds UI-specific data
+export const STATUS_LABELS = {
+  'NEW CASE': 'NEW CASE',  // Matches backend STATUS_DISPLAY_MAP
+  // ...
+}
+export const STATUS_COLORS = { ... }  // Frontend-only: UI colors
+```
+
+### When NOT to Share
+
+**❌ Don't share:**
+- Framework-specific code (React hooks, Hono middleware)
+- Database queries (backend-only)
+- UI components (frontend-only)
+- API client code (frontend-only)
+- Authentication middleware (backend-only)
+
+---
+
+## 🔌 API & Data Contract Rules
+
+### API Response Format
+
+**✅ DO:**
+- Use **consistent response structure** across all endpoints
+- Define **shared TypeScript interfaces** for API responses
+- Document **data contracts** in code comments
+
+**Standard Response Format:**
+```typescript
+// Success response
+{
+  success: true,
+  data: T
+}
+
+// Error response
+{
+  success: false,
+  error: string
+}
+```
+
+### Data Transformation
+
+**✅ DO:**
+- Transform data **once** (prefer backend)
+- Use **same field names** in API and frontend
+- Use **same date formats** (YYYY-MM-DD for dates, HH:MM for times)
+
+**❌ DON'T:**
+- Transform same data multiple times
+- Use different field names in API vs frontend
+- Mix date formats (ISO strings vs timestamps)
+
+### API Client Usage
+
+**✅ DO:**
+- Use **centralized API client** (`frontend/src/lib/apiClient.ts`)
+- Define **API endpoints as constants**
+- Use **typed API functions** in service files
+
+**Example:**
+```typescript
+// frontend/src/services/checkinsService.ts
+import { apiClient } from '../lib/apiClient'
+
+export async function getCheckIns(params: CheckInParams) {
+  return apiClient.get<CheckInResponse>('/api/checkins', { params })
+}
+```
+
+---
+
+## 🔒 Validation & Security Rules
+
+### Validation Strategy
+
+**✅ DO:**
+- **Backend**: Full validation (security, data integrity)
+- **Frontend**: Lightweight validation (UX, immediate feedback)
+- **Same rules**: Use same validation logic where possible
+
+**Example:**
+```typescript
+// backend/src/utils/validationUtils.ts
+export function validateEmail(email: string): boolean {
+  // Strict validation for security
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 255
+}
+
+// frontend/src/utils/validationUtils.ts (if needed)
+export function validateEmail(email: string): boolean {
+  // Same logic, but can add UX enhancements (e.g., debouncing)
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 255
+}
+```
+
+### Security Rules
+
+**✅ DO:**
+- **Sanitize** all user inputs (backend)
+- **Validate** all data from API (frontend)
+- **Never trust** client-side validation alone
+- **Use whitelist** approach for enums/constants
+
+**Example:**
+```typescript
+// backend/src/utils/notesParser.ts
+const VALID_DUTY_TYPES = ['modified', 'full'] as const
+
+function validateDutyType(dutyType: any): string | null {
+  // ✅ Whitelist approach - secure
+  const normalized = dutyType.trim().toLowerCase()
+  return VALID_DUTY_TYPES.includes(normalized) ? normalized : null
+}
+```
+
+---
+
+## 📅 Date & Time Handling
+
+### Date Format Standards
+
+**✅ DO:**
+- Use **YYYY-MM-DD** for dates (ISO date format)
+- Use **HH:MM** for times (24-hour format)
+- Use **UTC** for storage, convert to local for display
+- Create **date utilities** for common operations
+
+### Date Utility Organization
+
+**Backend (`backend/src/utils/dateUtils.ts`):**
+- Database query helpers: `getTodayDateString()`, `getStartOfWeekDateString()`
+- Date calculations: `getFirstDayOfMonthString()`, `dateToDateString()`
+- Validation: `isValidDateString()`
+
+**Frontend (`frontend/src/utils/dateUtils.ts`):**
+- Same basic functions for form defaults, filters
+- Additional display formatting in `dateTime.ts`
+
+**Frontend (`frontend/src/utils/dateTime.ts`):**
+- Display formatting: `formatDateDisplay()`, `formatTime()`, `formatDateWithWeekday()`
+- UI-specific: `normalizeTime()` for input fields
+
+**✅ DO:**
+- Keep date **calculation logic** consistent between frontend/backend
+- Use **same date string format** (YYYY-MM-DD) everywhere
+- Separate **calculation** from **display formatting**
+
+**Example:**
+```typescript
+// ✅ GOOD: Same logic, same format
+// backend/src/utils/dateUtils.ts
+export function getTodayDateString(): string {
+  return new Date().toISOString().split('T')[0]  // YYYY-MM-DD
+}
+
+// frontend/src/utils/dateUtils.ts
+export function getTodayDateString(): string {
+  return new Date().toISOString().split('T')[0]  // Same format
+}
+
+// frontend/src/utils/dateTime.ts (display only)
+export function formatDateDisplay(dateStr: string): string {
+  // Converts YYYY-MM-DD to "Jan 15, 2024" for UI
+}
+```
+
+---
+
+## ⚠️ Error Handling Standards
+
+### Error Response Format
+
+**✅ DO:**
+- Use **consistent error structure**
+- Include **error messages** that are user-friendly
+- Log **detailed errors** on backend (not exposed to frontend)
+
+**Standard Error Format:**
+```typescript
+{
+  success: false,
+  error: string  // User-friendly message
+}
+```
+
+### Error Handling Utilities
+
+**✅ DO:**
+- Create **error handling utilities** for common patterns
+- Use **try-catch** consistently
+- Handle **API errors** in centralized location
+
+**Example:**
+```typescript
+// frontend/src/utils/apiHelpers.ts
+export async function handleApiResponse<T>(response: Response) {
+  // Centralized error handling
+  const data = await safeJsonParse<T>(response)
+  if (!response.ok) {
+    return { success: false, error: data?.error || 'Request failed' }
+  }
+  return { success: true, data }
+}
+```
+
+---
+
+## 📐 Type Definitions & Interfaces
+
+### Type Sharing Strategy
+
+**Current Approach (Recommended):**
+- Define types **separately** in frontend/backend
+- Keep types **synchronized** manually (document relationships)
+- Use **same structure** and **same field names**
+
+**Future Approach (If using monorepo):**
+- Create `shared/types/` package
+- Import from shared location
+- Single source of truth for types
+
+### Type Naming
+
+**✅ DO:**
+- Use **PascalCase**: `CaseStatus`, `ParsedNotes`, `UserRole`
+- Use **descriptive names**: `ExecutiveBusinessInfo` not `Info`
+- Use **consistent naming** between frontend/backend
+
+**Example:**
+```typescript
+// backend/src/utils/notesParser.ts
+export interface ParsedNotes {
+  case_status?: string | null
+  approved_by?: string | null
+  // ...
+}
+
+// frontend/src/utils/notesParser.ts
+export interface ParsedNotes {
+  readonly case_status?: string | null
+  readonly approved_by?: string | null
+  // Same structure, frontend uses readonly for immutability
+}
+```
+
+---
+
+## ✅ Migration & Refactoring Checklist
+
+### Before Creating New Utility
+
+- [ ] **Search** codebase for existing similar functions
+- [ ] **Check** both `frontend/src/utils/` and `backend/src/utils/`
+- [ ] **Verify** function will be used in 2+ places
+- [ ] **Determine** if backend-only, frontend-only, or both
+- [ ] **Choose** appropriate file name following conventions
+- [ ] **Write** JSDoc comments explaining purpose
+- [ ] **Export** function with proper TypeScript types
+
+### Before Refactoring Existing Code
+
+- [ ] **Identify** all places using duplicated logic
+- [ ] **Create** utility function with tests (if applicable)
+- [ ] **Update** all usages to import from utility
+- [ ] **Remove** old duplicated code
+- [ ] **Verify** no functionality is broken
+- [ ] **Update** documentation if needed
+
+### Code Review Checklist
+
+- [ ] **No duplication**: Logic used in 2+ places is in utility
+- [ ] **Proper location**: Backend utils in backend, frontend utils in frontend
+- [ ] **Consistent naming**: Follows naming conventions
+- [ ] **Type safety**: Proper TypeScript types
+- [ ] **Documentation**: JSDoc comments for public functions
+- [ ] **Error handling**: Proper error handling in utilities
+- [ ] **Security**: Input validation and sanitization where needed
+
+---
+
+## 📚 Examples & Patterns
+
+### ✅ Good Pattern: Reusable Date Utility
+
+```typescript
+// backend/src/utils/dateUtils.ts
+/**
+ * Get today's date in YYYY-MM-DD format
+ * Used across multiple routes for date filtering
+ */
+export function getTodayDateString(): string {
+  return new Date().toISOString().split('T')[0]
+}
+
+// Used in:
+// - backend/src/routes/supervisor.ts
+// - backend/src/routes/clinician.ts
+// - backend/src/routes/worker.ts
+```
+
+### ✅ Good Pattern: Shared Constants
+
+```typescript
+// backend/src/utils/caseStatus.ts
+export const VALID_CASE_STATUSES = ['new', 'triaged', 'assessed', ...] as const
+export const STATUS_DISPLAY_MAP: Record<CaseStatus, string> = {
+  'new': 'NEW CASE',
+  // ...
+}
+
+// frontend/src/utils/caseStatus.ts
+// Matches backend STATUS_DISPLAY_MAP values
+export const STATUS_LABELS: Record<string, string> = {
+  'NEW CASE': 'NEW CASE',  // Must match backend
+  // ...
+}
+export const STATUS_COLORS = { ... }  // Frontend-only UI data
+```
+
+### ✅ Good Pattern: Validation Utility
+
+```typescript
+// backend/src/utils/validationUtils.ts
+export function validateEmail(email: string): boolean {
+  if (!email || typeof email !== 'string') return false
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 255
+}
+
+// Used in multiple routes for consistent validation
+```
+
+### ❌ Bad Pattern: Duplicated Logic
+
+```typescript
+// ❌ BAD: Same logic in multiple files
+// file1.ts
+const today = new Date().toISOString().split('T')[0]
+
+// file2.ts  
+const today = new Date().toISOString().split('T')[0]
+
+// file3.ts
+const today = new Date().toISOString().split('T')[0]
+
+// ✅ GOOD: Use utility
+import { getTodayDateString } from '../utils/dateUtils'
+const today = getTodayDateString()
+```
+
+---
+
+## 🎯 Quick Reference
+
+### File Location Decision Tree
+
+```
+Is this logic used in 2+ places?
+├─ NO → Keep inline or in component/route
+└─ YES → Is it framework-specific?
+    ├─ YES (React/Hono) → Put in respective utils folder
+    └─ NO (Pure function) → 
+        ├─ Backend-only? → backend/src/utils/
+        ├─ Frontend-only? → frontend/src/utils/
+        └─ Both need it? → Create separate but consistent implementations
+```
+
+### Naming Quick Reference
+
+| Purpose | Prefix | Example |
+|---------|--------|---------|
+| Retrieve data | `get*` | `getUserById()` |
+| Format for display | `format*` | `formatDateDisplay()` |
+| Validate input | `validate*` | `validateEmail()` |
+| Parse/transform | `parse*` | `parseNotes()` |
+| Boolean check | `is*` / `has*` | `isExceptionActive()` |
+| Create new | `create*` | `createUser()` |
+| Update existing | `update*` | `updateUser()` |
+
+---
+
+## 📝 Notes
+
+- **This document is living**: Update as patterns evolve
+- **Review regularly**: Check for new duplication during code reviews
+- **Enforce in PRs**: Use this document as reference during code reviews
+- **Refactor gradually**: Don't need to refactor everything at once, but follow rules for new code
+
+---
+
+**Questions or suggestions?** Update this document and share with the team.
+

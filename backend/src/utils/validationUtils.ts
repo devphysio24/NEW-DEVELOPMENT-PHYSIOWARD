@@ -87,6 +87,6 @@ export function validateEmail(email: any): { valid: boolean; error?: string } {
   if (trimmed.length > 255) {
     return { valid: false, error: 'Email must be less than 255 characters' }
   }
-  return { valid: true }
+  return { valid: true, value: trimmed }
 }
 

@@ -5,6 +5,7 @@ import { getCaseStatusFromNotes } from '../utils/caseStatus.js'
 import { getAdminClient } from '../utils/adminClient.js'
 import { parseTime, compareTime, formatDateString, parseDateString } from '../utils/dateTime.js'
 import { getTodayDateString, dateToDateString } from '../utils/dateUtils.js'
+import { ROLES } from '../constants/roles.js'
 
 // Date/time utilities are now imported from '../utils/dateTime'
 
@@ -201,7 +202,7 @@ async function getWorkerShiftInfo(userId: string, targetDate?: Date): Promise<{
   // First, check for single-date schedule (works for ANY date including weekends)
   const { data: singleDateSchedule, error: singleDateError } = await adminClient
     .from('worker_schedules')
-    .select('*')
+    .select('id, worker_id, team_id, scheduled_date, day_of_week, start_time, end_time, effective_date, expiry_date, is_active, requires_daily_checkin, daily_checkin_start_time, daily_checkin_end_time, created_at, updated_at')
     .eq('worker_id', userId)
     .eq('scheduled_date', targetStr)
     .eq('is_active', true)
@@ -224,7 +225,7 @@ async function getWorkerShiftInfo(userId: string, targetDate?: Date): Promise<{
     // Since Supabase OR syntax is limited, we'll fetch and filter in memory if needed
     let { data: recurringSchedule, error: recurringError } = await adminClient
       .from('worker_schedules')
-      .select('*')
+      .select('id, worker_id, team_id, scheduled_date, day_of_week, start_time, end_time, effective_date, expiry_date, is_active, requires_daily_checkin, daily_checkin_start_time, daily_checkin_end_time, created_at, updated_at')
       .eq('worker_id', userId)
       .eq('day_of_week', targetDayOfWeek) // Matches any day 0-6 (including weekends: Saturday=6, Sunday=0)
       .eq('is_active', true)
@@ -244,7 +245,8 @@ async function getWorkerShiftInfo(userId: string, targetDate?: Date): Promise<{
       })
       
       // Use the first matching schedule
-      recurringSchedule = recurringSchedule.length > 0 ? recurringSchedule[0] : null
+      const firstSchedule = recurringSchedule.length > 0 ? recurringSchedule[0] : null
+      recurringSchedule = firstSchedule as any
     } else {
       recurringSchedule = null
     }
@@ -324,7 +326,7 @@ async function getNextShiftInfoOptimized(userId: string, startFromDate: Date = n
   // Fetch ALL active schedules for this worker ONCE (instead of querying per day)
   const { data: allSchedules, error } = await adminClient
     .from('worker_schedules')
-    .select('*')
+    .select('id, worker_id, team_id, scheduled_date, day_of_week, start_time, end_time, effective_date, expiry_date, is_active, requires_daily_checkin, daily_checkin_start_time, daily_checkin_end_time, created_at, updated_at')
     .eq('worker_id', userId)
     .eq('is_active', true)
     .order('start_time', { ascending: true })
@@ -475,7 +477,7 @@ async function getNextShiftInfoOptimized(userId: string, startFromDate: Date = n
 const checkins = new Hono<{ Variables: AuthVariables }>()
 
 // Get worker's check-in status for today (worker only)
-checkins.get('/status', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/status', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -483,7 +485,7 @@ checkins.get('/status', authMiddleware, requireRole(['worker']), async (c) => {
     }
 
     // Additional role verification - double check to ensure user is actually a worker
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[GET /checkins/status] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -559,14 +561,14 @@ checkins.get('/status', authMiddleware, requireRole(['worker']), async (c) => {
 })
 
 // Get worker's check-in history with pagination (worker only)
-checkins.get('/history', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/history', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[GET /checkins/history] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -617,14 +619,14 @@ checkins.get('/history', authMiddleware, requireRole(['worker']), async (c) => {
 })
 
 // Get warm-up status for today (worker only)
-checkins.get('/warm-up/status', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/warm-up/status', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[GET /checkins/warm-up/status] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -650,7 +652,7 @@ checkins.get('/warm-up/status', authMiddleware, requireRole(['worker']), async (
 })
 
 // Get worker's shift info and check-in window (worker only)
-checkins.get('/shift-info', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/shift-info', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -659,7 +661,7 @@ checkins.get('/shift-info', authMiddleware, requireRole(['worker']), async (c) =
     }
 
     // Additional role verification - double check to ensure user is actually a worker
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[GET /checkins/shift-info] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -698,14 +700,14 @@ checkins.get('/shift-info', authMiddleware, requireRole(['worker']), async (c) =
 })
 
 // Get worker dashboard data (optimized - combines team, check-in status, shift info, and next shift)
-checkins.get('/dashboard', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/dashboard', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
 
@@ -840,7 +842,7 @@ checkins.get('/dashboard', authMiddleware, requireRole(['worker']), async (c) =>
 })
 
 // Get worker's next shift info (tomorrow or next scheduled day)
-checkins.get('/next-shift-info', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/next-shift-info', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -848,7 +850,7 @@ checkins.get('/next-shift-info', authMiddleware, requireRole(['worker']), async 
       return c.json({ error: 'Unauthorized: User not found in context' }, 401)
     }
 
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[GET /checkins/next-shift-info] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -880,7 +882,7 @@ checkins.get('/next-shift-info', authMiddleware, requireRole(['worker']), async 
 })
 
 // Submit daily check-in (worker only)
-checkins.post('/submit', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.post('/submit', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -888,7 +890,7 @@ checkins.post('/submit', authMiddleware, requireRole(['worker']), async (c) => {
     }
 
     // Additional role verification - double check to ensure user is actually a worker
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[POST /checkins] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -1069,7 +1071,6 @@ checkins.post('/submit', authMiddleware, requireRole(['worker']), async (c) => {
       }
     }
 
-    // Cache invalidation removed - cache.js was deleted as unused code
 
     return c.json({
       message: 'Check-in submitted successfully',
@@ -1088,7 +1089,7 @@ checkins.post('/submit', authMiddleware, requireRole(['worker']), async (c) => {
 })
 
 // Mark warm-up as complete (worker only)
-checkins.post('/warm-up', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.post('/warm-up', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1096,7 +1097,7 @@ checkins.post('/warm-up', authMiddleware, requireRole(['worker']), async (c) => 
     }
 
     // Additional role verification - double check to ensure user is actually a worker
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       console.warn(`[POST /checkins/warm-up] SECURITY: User ${user.id} (${user.email}) with role '${user.role}' attempted to access worker-only endpoint. Access denied.`)
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
@@ -1142,7 +1143,7 @@ checkins.post('/warm-up', authMiddleware, requireRole(['worker']), async (c) => 
 })
 
 // Get worker's active rehabilitation plan
-checkins.get('/rehabilitation-plan', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/rehabilitation-plan', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1348,8 +1349,241 @@ checkins.get('/rehabilitation-plan', authMiddleware, requireRole(['worker']), as
   }
 })
 
+// Get worker's rehabilitation plan progress (for a specific exception/case)
+checkins.get('/rehabilitation-plan/progress', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const exceptionId = c.req.query('exception_id')
+    if (!exceptionId) {
+      return c.json({ error: 'exception_id is required' }, 400)
+    }
+
+    const adminClient = getAdminClient()
+
+    // SECURITY: Verify the exception belongs to this worker
+    const { data: exception, error: exceptionError } = await adminClient
+      .from('worker_exceptions')
+      .select('id, user_id, created_at')
+      .eq('id', exceptionId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (exceptionError || !exception) {
+      return c.json({ error: 'Exception not found or not authorized' }, 404)
+    }
+
+    // Get rehabilitation plan for this exception
+    const { data: plan, error: planError } = await adminClient
+      .from('rehabilitation_plans')
+      .select(`
+        *,
+        worker_exceptions!rehabilitation_plans_exception_id_fkey(
+          id,
+          user_id,
+          created_at,
+          users!worker_exceptions_user_id_fkey(
+            id,
+            email,
+            first_name,
+            last_name,
+            full_name
+          )
+        ),
+        rehabilitation_exercises(
+          id,
+          exercise_name,
+          exercise_order
+        )
+      `)
+      .eq('exception_id', exceptionId)
+      .single()
+
+    if (planError || !plan) {
+      return c.json({ error: 'Rehabilitation plan not found' }, 404)
+    }
+
+    const workerUser = Array.isArray(plan.worker_exceptions?.users) 
+      ? plan.worker_exceptions.users[0] 
+      : plan.worker_exceptions?.users
+
+    // Format worker name
+    const formatUserName = (user: any): string => {
+      if (!user) return 'Unknown'
+      if (user.full_name) return user.full_name
+      if (user.first_name && user.last_name) return `${user.first_name} ${user.last_name}`
+      return user.email || 'Unknown'
+    }
+
+    // Generate case number
+    const generateCaseNumber = (exceptionId: string, createdAt: string): string => {
+      const date = new Date(createdAt)
+      const year = date.getFullYear()
+      const month = String(date.getMonth() + 1).padStart(2, '0')
+      const day = String(date.getDate()).padStart(2, '0')
+      const hours = String(date.getHours()).padStart(2, '0')
+      const minutes = String(date.getMinutes()).padStart(2, '0')
+      const seconds = String(date.getSeconds()).padStart(2, '0')
+      const uuidPrefix = exceptionId?.substring(0, 4)?.toUpperCase() || 'CASE'
+      return `CASE-${year}${month}${day}-${hours}${minutes}${seconds}-${uuidPrefix}`
+    }
+
+    // Get all completions for this plan
+    const { data: completions } = await adminClient
+      .from('rehabilitation_plan_completions')
+      .select('completion_date, exercise_id')
+      .eq('plan_id', plan.id)
+      .eq('user_id', user.id)
+      .order('completion_date', { ascending: true })
+
+    // Group completions by date
+    const completionsByDate = new Map<string, Set<string>>()
+    if (completions) {
+      for (const completion of completions) {
+        const dateStr = typeof completion.completion_date === 'string' 
+          ? completion.completion_date.split('T')[0]
+          : formatDateString(new Date(completion.completion_date))
+        
+        if (!completionsByDate.has(dateStr)) {
+          completionsByDate.set(dateStr, new Set())
+        }
+        completionsByDate.get(dateStr)!.add(completion.exercise_id)
+      }
+    }
+
+    // Sort exercises by order
+    const exercises = (plan.rehabilitation_exercises || [])
+      .sort((a: any, b: any) => a.exercise_order - b.exercise_order)
+      .map((ex: any) => ({
+        id: ex.id,
+        exercise_name: ex.exercise_name,
+        exercise_order: ex.exercise_order,
+      }))
+
+    const totalExercises = exercises.length
+
+    // Parse dates
+    const startDate = parseDateString(plan.start_date)
+    const endDate = parseDateString(plan.end_date)
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    
+    const totalDays = Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1
+    const now = new Date()
+
+    // Build daily progress array
+    const dailyProgress: Array<{
+      dayNumber: number
+      date: string
+      status: 'completed' | 'current' | 'pending'
+      exercisesCompleted: number
+      totalExercises: number
+      isFullyCompleted: boolean
+    }> = []
+
+    let currentDay = 1
+    let daysCompleted = 0
+
+    for (let dayOffset = 0; dayOffset < totalDays; dayOffset++) {
+      const dayDate = new Date(startDate)
+      dayDate.setDate(dayDate.getDate() + dayOffset)
+      const dayDateStr = formatDateString(dayDate)
+      const dayNumber = dayOffset + 1
+
+      const dayCompletions = completionsByDate.get(dayDateStr) || new Set()
+      const exercisesCompleted = dayCompletions.size
+      const allExercisesCompleted = totalExercises > 0 && exercises.every((ex: any) => dayCompletions.has(ex.id))
+
+      let status: 'completed' | 'current' | 'pending'
+      if (dayDate > today) {
+        status = 'pending'
+      } else if (allExercisesCompleted) {
+        status = 'completed'
+        daysCompleted++
+      } else if (dayNumber === currentDay) {
+        status = 'current'
+      } else {
+        status = 'current'
+      }
+
+      dailyProgress.push({
+        dayNumber,
+        date: dayDateStr,
+        status,
+        exercisesCompleted,
+        totalExercises,
+        isFullyCompleted: allExercisesCompleted,
+      })
+
+      // Update currentDay logic (same as in clinician endpoint)
+      if (dayDate > today) {
+        if (currentDay === dayNumber) {
+          currentDay = dayNumber
+          break
+        }
+      } else if (allExercisesCompleted) {
+        if (dayOffset < totalDays - 1) {
+          const nextDayDate = new Date(dayDate)
+          nextDayDate.setDate(dayDate.getDate() + 1)
+          nextDayDate.setHours(6, 0, 0, 0)
+          if (now >= nextDayDate) {
+            currentDay = dayOffset + 2
+          } else {
+            currentDay = dayOffset + 1
+            break
+          }
+        } else {
+          currentDay = totalDays
+          break
+        }
+      } else {
+        currentDay = dayNumber
+        break
+      }
+    }
+
+    // Update status based on currentDay
+    for (let i = 0; i < dailyProgress.length; i++) {
+      const day = dailyProgress[i]
+      if (day.dayNumber === currentDay && day.status !== 'completed') {
+        day.status = 'current'
+      } else if (day.dayNumber > currentDay) {
+        day.status = 'pending'
+      } else if (day.isFullyCompleted && day.dayNumber < currentDay) {
+        day.status = 'completed'
+      }
+    }
+
+    const progress = totalDays > 0 ? Math.round((daysCompleted / totalDays) * 100) : 0
+
+    return c.json({
+      plan: {
+        id: plan.id,
+        plan_name: plan.plan_name,
+        plan_description: plan.plan_description,
+        workerName: formatUserName(workerUser),
+        caseNumber: generateCaseNumber(exception.id, exception.created_at),
+        startDate: plan.start_date,
+        endDate: plan.end_date,
+        duration: totalDays,
+        progress,
+        currentDay,
+        daysCompleted,
+        status: plan.status,
+      },
+      dailyProgress,
+    })
+  } catch (error: any) {
+    console.error('[GET /checkins/rehabilitation-plan/progress] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})
+
 // Get completed exercises for a specific date
-checkins.get('/rehabilitation-plan/completions', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/rehabilitation-plan/completions', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1382,7 +1616,7 @@ checkins.get('/rehabilitation-plan/completions', authMiddleware, requireRole(['w
 })
 
 // Mark exercise as completed for the current day of the plan
-checkins.post('/rehabilitation-plan/complete-exercise', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.post('/rehabilitation-plan/complete-exercise', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1512,7 +1746,7 @@ checkins.post('/rehabilitation-plan/complete-exercise', authMiddleware, requireR
     // Verify the record was saved
     const { data: verifyData } = await adminClient
       .from('rehabilitation_plan_completions')
-      .select('*')
+      .select('id, plan_id, exercise_id, user_id, completion_date, created_at, updated_at')
       .eq('plan_id', plan_id)
       .eq('exercise_id', exercise_id)
       .eq('user_id', user.id)
@@ -1529,7 +1763,7 @@ checkins.post('/rehabilitation-plan/complete-exercise', authMiddleware, requireR
 })
 
 // Get worker appointments
-checkins.get('/appointments', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/appointments', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1668,7 +1902,7 @@ checkins.get('/appointments', authMiddleware, requireRole(['worker']), async (c)
 })
 
 // Update appointment status (approve/decline)
-checkins.patch('/appointments/:id/status', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.patch('/appointments/:id/status', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1736,7 +1970,7 @@ checkins.patch('/appointments/:id/status', authMiddleware, requireRole(['worker'
 })
 
 // Get notifications for worker
-checkins.get('/notifications', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.get('/notifications', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1750,7 +1984,7 @@ checkins.get('/notifications', authMiddleware, requireRole(['worker']), async (c
 
     let query = adminClient
       .from('notifications')
-      .select('*')
+      .select('id, user_id, type, title, message, data, is_read, created_at, read_at')
       .eq('user_id', user.id)
       .order('created_at', { ascending: false })
       .limit(limit)
@@ -1787,7 +2021,7 @@ checkins.get('/notifications', authMiddleware, requireRole(['worker']), async (c
 })
 
 // Mark notification as read (worker)
-checkins.patch('/notifications/:notificationId/read', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.patch('/notifications/:notificationId/read', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -1835,7 +2069,7 @@ checkins.patch('/notifications/:notificationId/read', authMiddleware, requireRol
 })
 
 // Mark all notifications as read (worker)
-checkins.patch('/notifications/read-all', authMiddleware, requireRole(['worker']), async (c) => {
+checkins.patch('/notifications/read-all', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {

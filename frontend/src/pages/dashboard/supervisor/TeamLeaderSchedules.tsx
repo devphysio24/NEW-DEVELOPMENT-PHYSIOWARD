@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { DashboardLayout } from '../../../components/DashboardLayout'
 import { Loading } from '../../../components/Loading'
-import { API_BASE_URL } from '../../../config/api'
+import { apiClient, isApiError, getApiErrorMessage } from '../../../lib/apiClient'
+import { API_ROUTES } from '../../../config/apiRoutes'
 import './TeamLeaderSchedules.css'
 
 interface WorkSchedule {
@@ -115,18 +116,15 @@ export function TeamLeaderSchedules() {
     if (!confirm('Are you sure you want to delete this schedule?')) return
     
     try {
-      const response = await fetch(`${API_BASE_URL}/api/schedules/${scheduleId}`, {
-        method: 'DELETE',
-        credentials: 'include',
-      })
-      if (!response.ok) throw new Error('Failed to delete schedule')
+      const result = await apiClient.delete(API_ROUTES.SCHEDULES.SCHEDULE(scheduleId))
+      if (isApiError(result)) throw new Error(getApiErrorMessage(result) || 'Failed to delete schedule')
       
       // Reload team leaders and update selected one
-      const refreshResponse = await fetch(`${API_BASE_URL}/api/schedules/team-leaders`, {
-        credentials: 'include',
-      })
-      if (refreshResponse.ok) {
-        const refreshData = await refreshResponse.json()
+      const refreshResult = await apiClient.get<{ teamLeaders: TeamLeader[] }>(
+        API_ROUTES.SCHEDULES.TEAM_LEADERS
+      )
+      if (!isApiError(refreshResult)) {
+        const refreshData = refreshResult.data
         const updatedLeaders = refreshData.teamLeaders || []
         setTeamLeaders(updatedLeaders)
         if (selectedTeamLeader) {
@@ -145,12 +143,6 @@ export function TeamLeaderSchedules() {
     if (!selectedTeamLeader) return
 
     try {
-      const url = editingSchedule
-        ? `${API_BASE_URL}/api/schedules/${editingSchedule.id}`
-        : `${API_BASE_URL}/api/schedules`
-      
-      const method = editingSchedule ? 'PUT' : 'POST'
-      
       let payload: any
       
       if (editingSchedule) {
@@ -163,6 +155,19 @@ export function TeamLeaderSchedules() {
           effective_date: formData.effective_date || null,
           expiry_date: formData.expiry_date || null,
           notes: formData.notes || null,
+        }
+        
+        const result = await apiClient.put<{ message?: string }>(
+          API_ROUTES.SCHEDULES.SCHEDULE(editingSchedule.id),
+          payload
+        )
+        
+        if (isApiError(result)) {
+          throw new Error(getApiErrorMessage(result) || 'Failed to save schedule')
+        }
+        
+        if (result.data.message) {
+          alert(result.data.message)
         }
       } else {
         // Creating new schedule(s)
@@ -192,32 +197,27 @@ export function TeamLeaderSchedules() {
             notes: formData.notes || null,
           }
         }
-      }
-
-      const response = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify(payload),
-      })
-
-      const responseData = await response.json()
-      
-      if (!response.ok) {
-        throw new Error(responseData.error || 'Failed to save schedule')
-      }
-
-      if (responseData.message) {
-        // Show success message for bulk creation
-        alert(responseData.message)
+        
+        const result = await apiClient.post<{ message?: string }>(
+          API_ROUTES.SCHEDULES.BASE,
+          payload
+        )
+        
+        if (isApiError(result)) {
+          throw new Error(getApiErrorMessage(result) || 'Failed to save schedule')
+        }
+        
+        if (result.data.message) {
+          alert(result.data.message)
+        }
       }
       
       // Reload team leaders and update selected one
-      const refreshResponse = await fetch(`${API_BASE_URL}/api/schedules/team-leaders`, {
-        credentials: 'include',
-      })
-      if (refreshResponse.ok) {
-        const refreshData = await refreshResponse.json()
+      const refreshResult = await apiClient.get<{ teamLeaders: TeamLeader[] }>(
+        API_ROUTES.SCHEDULES.TEAM_LEADERS
+      )
+      if (!isApiError(refreshResult)) {
+        const refreshData = refreshResult.data
         const updatedLeaders = refreshData.teamLeaders || []
         setTeamLeaders(updatedLeaders)
         const updated = updatedLeaders.find((tl: TeamLeader) => tl.id === selectedTeamLeader.id)
@@ -343,20 +343,15 @@ export function TeamLeaderSchedules() {
     try {
       // Delete all schedules in parallel
       await Promise.all(
-        scheduleIds.map(id => 
-          fetch(`${API_BASE_URL}/api/schedules/${id}`, {
-            method: 'DELETE',
-            credentials: 'include',
-          })
-        )
+        scheduleIds.map(id => apiClient.delete(API_ROUTES.SCHEDULES.SCHEDULE(id)))
       )
       
       // Reload team leaders
-      const refreshResponse = await fetch(`${API_BASE_URL}/api/schedules/team-leaders`, {
-        credentials: 'include',
-      })
-      if (refreshResponse.ok) {
-        const refreshData = await refreshResponse.json()
+      const refreshResult = await apiClient.get<{ teamLeaders: TeamLeader[] }>(
+        API_ROUTES.SCHEDULES.TEAM_LEADERS
+      )
+      if (!isApiError(refreshResult)) {
+        const refreshData = refreshResult.data
         const updatedLeaders = refreshData.teamLeaders || []
         setTeamLeaders(updatedLeaders)
         if (selectedTeamLeader) {

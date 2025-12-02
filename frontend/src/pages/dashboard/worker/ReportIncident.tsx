@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { DashboardLayout } from '../../../components/DashboardLayout'
-import { API_BASE_URL } from '../../../config/api'
 import { useAuth } from '../../../contexts/AuthContext'
+import { apiClient, isApiError, getApiErrorMessage } from '../../../lib/apiClient'
+import { API_ROUTES } from '../../../config/apiRoutes'
+import { getTodayDateString } from '../../../utils/dateUtils'
 import './ReportIncident.css'
 
 interface ReportFormData {
@@ -31,14 +33,15 @@ export function ReportIncident() {
     const checkCanReport = async () => {
       try {
         setCheckingStatus(true)
-        const response = await fetch(`${API_BASE_URL}/api/worker/can-report-incident`, {
-          method: 'GET',
-          credentials: 'include',
-        })
+        const result = await apiClient.get<{
+          canReport: boolean
+          reason?: string
+          exceptionType?: string
+          startDate?: string
+        }>(API_ROUTES.WORKER.CAN_REPORT_INCIDENT)
 
-        const data = await response.json()
-
-        if (response.ok) {
+        if (!isApiError(result)) {
+          const data = result.data
           if (data.canReport) {
             setCanReport(true)
             setActiveCaseInfo(null)
@@ -66,12 +69,12 @@ export function ReportIncident() {
     if (role === 'worker') {
       checkCanReport()
     }
-  }, [role, API_BASE_URL])
+  }, [role])
   
   const [formData, setFormData] = useState<ReportFormData>({
     type: 'incident',
     description: '',
-    date: new Date().toISOString().split('T')[0],
+    date: getTodayDateString(),
     location: '',
     photo: null,
     severity: 'medium',
@@ -80,6 +83,7 @@ export function ReportIncident() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState(false)
+  const [showSuccessToast, setShowSuccessToast] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
   const [checkingStatus, setCheckingStatus] = useState(true)
   const [canReport, setCanReport] = useState(true)
@@ -95,6 +99,7 @@ export function ReportIncident() {
     severityAssessment: string
     followUpActions: string[]
     advice: string
+    imageAnalysis?: string
   } | null>(null)
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
@@ -161,29 +166,39 @@ export function ReportIncident() {
     setAnalysisResult(null)
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/worker/analyze-incident`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        credentials: 'include',
-        body: JSON.stringify({
-          type: formData.type,
-          description: formData.description,
-          location: formData.location,
-          severity: formData.severity,
-          date: formData.date,
-        }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to analyze incident report')
+      // Use FormData to support image upload for AI analysis
+      const analyzeFormData = new FormData()
+      analyzeFormData.append('type', formData.type)
+      analyzeFormData.append('description', formData.description)
+      analyzeFormData.append('location', formData.location)
+      analyzeFormData.append('severity', formData.severity)
+      analyzeFormData.append('date', formData.date)
+      
+      // Include photo for AI vision analysis if available
+      if (formData.photo) {
+        analyzeFormData.append('photo', formData.photo)
       }
 
-      if (data.success && data.analysis) {
-        setAnalysisResult(data.analysis)
+      const result = await apiClient.post<{
+        success: boolean
+        hasImageAnalysis?: boolean
+        analysis?: {
+          summary: string
+          riskLevel: 'low' | 'medium' | 'high' | 'critical'
+          recommendations: string[]
+          severityAssessment: string
+          followUpActions: string[]
+          advice: string
+          imageAnalysis?: string
+        }
+      }>(API_ROUTES.WORKER.ANALYZE_INCIDENT, analyzeFormData)
+
+      if (isApiError(result)) {
+        throw new Error(getApiErrorMessage(result) || 'Failed to analyze incident report')
+      }
+
+      if (result.data.success && result.data.analysis) {
+        setAnalysisResult(result.data.analysis)
       }
     } catch (err: any) {
       console.error('Error analyzing incident report:', err)
@@ -230,25 +245,30 @@ export function ReportIncident() {
         formDataToSend.append('photo', formData.photo)
       }
 
-      const response = await fetch(`${API_BASE_URL}/api/worker/report-incident`, {
-        method: 'POST',
-        credentials: 'include',
-        body: formDataToSend,
-      })
+      // Include AI analysis result if available
+      if (analysisResult) {
+        formDataToSend.append('ai_analysis_result', JSON.stringify(analysisResult))
+      }
 
-      const data = await response.json()
+      // Use centralized apiClient for FormData uploads
+      // apiClient now supports FormData and will handle Content-Type automatically
+      const result = await apiClient.post<{ success: boolean; message?: string }>(
+        API_ROUTES.WORKER.REPORT_INCIDENT,
+        formDataToSend
+      )
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to submit incident report')
+      if (isApiError(result)) {
+        throw new Error(getApiErrorMessage(result) || 'Failed to submit incident report')
       }
 
       setSuccess(true)
+      setShowSuccessToast(true)
       
       // Reset form
       setFormData({
         type: 'incident',
         description: '',
-        date: new Date().toISOString().split('T')[0],
+        date: getTodayDateString(),
         location: '',
         photo: null,
         severity: 'medium',
@@ -257,6 +277,11 @@ export function ReportIncident() {
       if (fileInputRef.current) {
         fileInputRef.current.value = ''
       }
+
+      // Auto-hide toast after 3 seconds
+      setTimeout(() => {
+        setShowSuccessToast(false)
+      }, 3000)
 
       // Redirect after 2 seconds
       setTimeout(() => {
@@ -387,7 +412,7 @@ export function ReportIncident() {
               value={formData.date}
               onChange={handleInputChange}
               className="form-input"
-              max={new Date().toISOString().split('T')[0]}
+              max={getTodayDateString()}
               required
             />
           </div>
@@ -527,6 +552,21 @@ export function ReportIncident() {
                       ))}
                     </ul>
                   </div>
+                  
+                  {/* Image Analysis - Only shown if photo was analyzed */}
+                  {analysisResult.imageAnalysis && (
+                    <div className="ai-analysis-item ai-image-analysis">
+                      <label>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginRight: '6px', verticalAlign: 'middle' }}>
+                          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                          <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                          <polyline points="21 15 16 10 5 21"></polyline>
+                        </svg>
+                        Photo Analysis
+                      </label>
+                      <p>{analysisResult.imageAnalysis}</p>
+                    </div>
+                  )}
                 </div>
               </div>
             </>
@@ -644,6 +684,18 @@ export function ReportIncident() {
             </button>
           </div>
         </form>
+
+        {/* Success Toast Notification */}
+        {showSuccessToast && (
+          <div className="success-toast">
+            <div className="success-toast-content">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+              <span>Report Incident submitted successfully!</span>
+            </div>
+          </div>
+        )}
       </div>
     </DashboardLayout>
   )

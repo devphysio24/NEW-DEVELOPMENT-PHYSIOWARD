@@ -1,0 +1,385 @@
+---
+alwaysApply: true
+---
+# Essential Development Rules
+
+**Pinakamahalagang rules para sa backend at frontend development. Sundin ito palagi.**
+
+---
+
+## 🎯 Core Principles (MUST FOLLOW)
+
+### 1. DRY (Don't Repeat Yourself)
+- ✅ **Gumawa ng utility** kapag logic ginagamit sa 2+ places
+- ❌ **HUWAG** mag-copy-paste ng code
+- ✅ **Gumamit ng existing utilities** bago gumawa ng bago
+
+### 2. Single Source of Truth
+- ✅ **Isang lugar lang** para sa constants, types, enums
+- ❌ **HUWAG** mag-duplicate ng type definitions
+- ✅ **Import from centralized locations**
+
+### 3. Search Before Create
+- ✅ **Search muna** bago gumawa ng bagong function/utility
+- ✅ **Check** `backend/src/utils/` at `frontend/src/utils/`
+- ✅ **Reuse existing** kung pwede
+ ✅ **Proper Foldering mo para hindi magulo**
+
+---
+
+## 🔧 Backend Rules (CRITICAL)
+
+### Database Operationscript
+// ✅ ALWAYS use getAdminClient()
+import { getAdminClient } from '../utils/adminClient.js'
+const adminClient = getAdminClient()
+
+// ❌ NEVER create new Supabase client
+### Route Handler Structure
+routeName.get('/endpoint', authMiddleware, requireRole(['role']), async (c) => {
+  try {
+    const user = c.get('user')
+    if (!user) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const adminClient = getAdminClient()
+    
+    // Validation
+    const emailValidation = validateEmail(body.email)
+    if (!emailValidation.valid) {
+      return c.json({ error: emailValidation.error }, 400)
+    }
+
+    // Business logic
+    const { data, error } = await adminClient.from('table').select('*')
+
+    if (error) {
+      return c.json({ error: 'Failed to fetch data', details: error.message }, 500)
+    }
+
+    return c.json({ success: true, data })
+
+  } catch (error: any) {
+    console.error('[GET /route/endpoint] Error:', error)
+    return c.json({ error: 'Internal server error', details: error.message }, 500)
+  }
+})### ALWAYS Use Utilities
+// ✅ GOOD: Use utilities
+import { getTodayDateString } from '../utils/dateUtils.js'
+import { validateEmail, validatePassword } from '../utils/validationUtils.js'
+import { formatUserFullName } from '../utils/userUtils.js'
+import { getCaseStatusFromNotes } from '../utils/caseStatus.js'
+
+// ❌ BAD: Duplicated logic
+const today = new Date().toISOString().split('T')[0]### Error Response Format
+// ✅ ALWAYS use this format
+{ success: false, error: string, details?: string }  // Error
+{ success: true, data: T }                          // Success### HTTP Status Codes
+- `400` - Bad Request (validation errors)
+- `401` - Unauthorized
+- `404` - Not Found
+- `409` - Conflict (duplicate)
+- `500` - Internal Server Error
+
+---
+
+## 🎨 Frontend Rules (CRITICAL)
+
+### Colors (ALWAYS USE THESE)ss
+/* Text */
+color: #0F172A;      /* Primary text */
+color: #64748B;      /* Secondary text */
+color: #94A3B8;      /* Tertiary text */
+
+/* Backgrounds */
+background: #FFFFFF;  /* Primary background */
+background: #F8FAFC;  /* Secondary background */
+
+/* Borders */
+border: 1px solid #E2E8F0;  /* Default border */
+
+/* Primary Actions */
+background: #3B82F6;  /* Primary button */
+background: #2563EB;  /* Primary hover */### Typography
+/* Page Title */
+font-size: 28px;
+font-weight: 600;
+color: #0F172A;
+letter-spacing: -0.02em;
+
+/* Section Title */
+font-size: 20px;
+font-weight: 600;
+color: #0F172A;
+
+/* Body Text */
+font-size: 15px;
+color: #0F172A;
+
+/* Labels */
+font-size: 13px;
+color: #64748B;
+font-weight: 500;### Spacing (Multiples of 4px)
+padding: 8px;    /* Small */
+padding: 12px;   /* Medium */
+padding: 16px;   /* Large */
+padding: 20px;   /* Extra large */
+padding: 24px;   /* Standard page padding */
+padding: 32px;   /* Section spacing */
+
+gap: 8px;        /* Small gap */
+gap: 12px;       /* Medium gap */
+gap: 16px;       /* Large gap */
+gap: 20px;       /* Card grid gap */### Standard Components
+
+#### Button
+.btn-primary {
+  padding: 10px 20px;
+  background: #3B82F6;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #2563EB;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+#### Card
+.card {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  padding: 24px;
+  transition: all 0.15s ease;
+}
+
+.card:hover {
+  border-color: #CBD5E1;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}#### Input
+.input {
+  width: 100%;
+  padding: 14px 16px;
+  font-size: 14px;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  background: #FFFFFF;
+  transition: all 0.2s ease;
+}
+
+.input:focus {
+  outline: none;
+  border-color: #3B82F6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}### Page Structure
+.page-container {
+  padding: 24px;
+  max-width: 1200px;  /* or 1600px for dashboards */
+  margin: 0 auto;
+  background: #FFFFFF;
+  min-height: calc(100vh - 64px);
+}
+
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 24px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #E2E8F0;
+}### Responsive Design
+/* Mobile-first approach */
+@media (max-width: 768px) {
+  .page-container {
+    padding: 16px;
+  }
+  
+  .card-grid {
+    grid-template-columns: 1fr;
+  }
+}---
+
+## 📁 File Organization
+
+### Backend Utils Location
+```
+backend/src/utils/
+├── dateUtils.ts          # Date calculations
+├── dateTime.ts           # Date formatting
+├── caseStatus.ts         # Case status operations
+├── notesParser.ts        # Notes parsing
+├── userUtils.ts          # User formatting
+├── exceptionUtils.ts    # Exception operations
+├── validationUtils.ts    # Input validation
+├── cursorPagination.ts   # Pagination
+└── adminClient.ts        # Database client
+```
+
+### Frontend Utils Location
+```
+frontend/src/utils/
+├── dateUtils.ts          # Date calculations
+├── dateTime.ts           # Date display formatting
+├── caseStatus.ts         # Case status (UI)
+├── notesParser.ts        # Notes parsing
+├── avatarUtils.ts        # Avatar helpers
+├── apiHelpers.ts         # API helpers
+└── queryBuilder.ts       # Query building
+```
+
+### CSS File Naming
+- Match component name: `ComponentName.css`
+- Use kebab-case: `clinician-dashboard.css`
+
+---
+
+## ✅ Before Creating New Code Checklist
+
+### Backend
+- [ ] **Search** existing utilities first
+- [ ] **Use** `getAdminClient()` for database
+- [ ] **Use** validation utilities (`validateEmail`, `validatePassword`)
+- [ ] **Use** date utilities (`getTodayDateString`)
+- [ ] **Follow** standard route handler structure
+- [ ] **Use** consistent error format
+- [ ] **Add** proper error handling
+
+### Frontend
+- [ ] **Use** standard colors (#0F172A, #64748B, #3B82F6, etc.)
+- [ ] **Use** standard spacing (multiples of 4px)
+- [ ] **Use** standard typography sizes
+- [ ] **Follow** standard component patterns (button, card, input)
+- [ ] **Test** responsive design (mobile)
+- [ ] **Use** standard page structure
+- [ ] **Check** existing pages for similar patterns
+
+---
+
+## 🚫 Common Mistakes to Avoid
+
+### Backend
+```typescript
+// ❌ BAD: Duplicated date logic
+const today = new Date().toISOString().split('T')[0]
+
+// ✅ GOOD: Use utility
+import { getTodayDateString } from '../utils/dateUtils.js'
+const today = getTodayDateString()
+
+// ❌ BAD: No validation
+const { email } = await c.req.json()
+await adminClient.from('users').insert({ email })
+
+// ✅ GOOD: Validate first
+const emailValidation = validateEmail(body.email)
+if (!emailValidation.valid) {
+  return c.json({ error: emailValidation.error }, 400)
+}
+
+// ❌ BAD: Creating new client
+const client = createClient(...)
+
+// ✅ GOOD: Use utility
+const adminClient = getAdminClient()
+```
+
+### Frontend
+```css
+/* ❌ BAD: Arbitrary colors */
+.title { color: #333333; }
+
+/* ✅ GOOD: Standard colors */
+.title { color: #0F172A; }
+
+/* ❌ BAD: Arbitrary spacing */
+.card { padding: 23px; }
+
+/* ✅ GOOD: Standard spacing */
+.card { padding: 24px; }
+
+/* ❌ BAD: No responsive */
+.grid { grid-template-columns: repeat(3, 1fr); }
+
+/* ✅ GOOD: Responsive */
+.grid { grid-template-columns: 1fr; }
+@media (min-width: 769px) {
+  .grid { grid-template-columns: repeat(3, 1fr); }
+}
+```
+
+---
+
+## 📚 Quick Reference
+
+### Backend Utilities to Use
+```typescript
+// Date
+import { getTodayDateString, getStartOfWeekDateString } from '../utils/dateUtils.js'
+
+// Validation
+import { validateEmail, validatePassword, validateStringInput } from '../utils/validationUtils.js'
+
+// User
+import { formatUserFullName, getUserInitials } from '../utils/userUtils.js'
+
+// Case Status
+import { getCaseStatusFromNotes, mapCaseStatusToDisplay } from '../utils/caseStatus.js'
+
+// Notes
+import { parseIncidentNotes } from '../utils/notesParser.js'
+
+// Database
+import { getAdminClient } from '../utils/adminClient.js'
+```
+
+### Frontend Utilities to Use
+```typescript
+// Date
+import { getTodayDateString } from '../utils/dateUtils.js'
+import { formatDateDisplay, formatTime } from '../utils/dateTime.js'
+
+// Case Status
+import { getStatusLabel, getStatusStyle } from '../utils/caseStatus.js'
+
+// Avatar
+import { getUserInitials, getAvatarColor } from '../utils/avatarUtils.js'
+
+// API
+import { handleApiResponse, safeJsonParse } from '../utils/apiHelpers.js'
+```
+
+### Standard Colors
+- Primary Text: `#0F172A`
+- Secondary Text: `#64748B`
+- Primary Button: `#3B82F6`
+- Border: `#E2E8F0`
+- Background: `#FFFFFF`
+
+### Standard Spacing
+- Small: `8px`
+- Medium: `12px`
+- Large: `16px`
+- Extra Large: `20px`
+- Standard: `24px`
+- Section: `32px`
+
+---
+
+## 🎯 Remember
+
+1. **Search before create** - Check existing utilities first
+2. **Use utilities** - Don't duplicate logic
+3. **Follow standards** - Colors, spacing, typography
+4. **Be consistent** - Match existing patterns
+5. **Test responsive** - Always test on mobile
+
+**Sundin ang rules na ito para malinis at consistent ang code!**
+alwaysApply: true
+---

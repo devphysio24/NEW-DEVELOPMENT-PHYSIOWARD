@@ -8,6 +8,7 @@ import {
   getExceptionTypeLabel,
   type WorkerException 
 } from '../utils/exceptionUtils.js'
+import { ROLES } from '../constants/roles.js'
 
 const schedules = new Hono<{ Variables: AuthVariables }>()
 
@@ -17,7 +18,7 @@ const schedules = new Hono<{ Variables: AuthVariables }>()
 // ============================================
 
 // Get worker schedules (Team Leader views schedules for workers in their team)
-schedules.get('/workers', authMiddleware, requireRole(['team_leader']), async (c) => {
+schedules.get('/workers', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -100,21 +101,21 @@ schedules.get('/workers', authMiddleware, requireRole(['team_leader']), async (c
 
 // Get worker's own schedule (Worker views their own schedules)
 // IMPORTANT: Only returns ACTIVE schedules - inactive schedules are excluded from future dates
-schedules.get('/my-schedule', authMiddleware, requireRole(['worker']), async (c) => {
+schedules.get('/my-schedule', authMiddleware, requireRole([ROLES.WORKER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    if (user.role !== 'worker') {
+    if (user.role !== ROLES.WORKER) {
       return c.json({ error: 'Forbidden: This endpoint is only accessible to workers' }, 403)
     }
 
     const adminClient = getAdminClient()
 
     // Get query params for date range
-    const startDateStr = c.req.query('startDate') || new Date().toISOString().split('T')[0]
+    const startDateStr = c.req.query('startDate') || getTodayDateString()
     const endDateStr = c.req.query('endDate') || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] // Default: next 7 days
 
     const startDate = new Date(startDateStr + 'T00:00:00.000Z')
@@ -125,7 +126,7 @@ schedules.get('/my-schedule', authMiddleware, requireRole(['worker']), async (c)
     // Get all ACTIVE schedules (both single-date and recurring)
     const { data: allSchedules, error: schedulesError } = await adminClient
       .from('worker_schedules')
-      .select('*')
+      .select('id, worker_id, team_id, scheduled_date, day_of_week, start_time, end_time, effective_date, expiry_date, is_active, requires_daily_checkin, daily_checkin_start_time, daily_checkin_end_time, created_at, updated_at')
       .eq('worker_id', user.id)
       .eq('is_active', true) // IMPORTANT: Only active schedules for future dates
 
@@ -229,7 +230,7 @@ schedules.get('/my-schedule', authMiddleware, requireRole(['worker']), async (c)
 
 // Create worker schedule (Team Leader only)
 // Supports single date or date range with day selection for bulk creation
-schedules.post('/workers', authMiddleware, requireRole(['team_leader']), async (c) => {
+schedules.post('/workers', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -377,7 +378,7 @@ schedules.post('/workers', authMiddleware, requireRole(['team_leader']), async (
       .from('users')
       .select('id, role')
       .eq('id', worker_id)
-      .eq('role', 'worker')
+      .eq('role', ROLES.WORKER)
       .single()
 
     if (workerError || !worker) {
@@ -551,7 +552,6 @@ schedules.post('/workers', authMiddleware, requireRole(['team_leader']), async (
       }, 500)
     }
 
-    // Cache invalidation removed - cache.js was deleted as unused code
 
     const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
     const createdDays = isRecurringMode 
@@ -571,7 +571,7 @@ schedules.post('/workers', authMiddleware, requireRole(['team_leader']), async (
 })
 
 // Update worker schedule (Team Leader only)
-schedules.put('/workers/:id', authMiddleware, requireRole(['team_leader']), async (c) => {
+schedules.put('/workers/:id', authMiddleware, requireRole([ROLES.TEAM_LEADER]), async (c) => {
   try {
     const user = c.get('user')
     if (!user) {
@@ -896,7 +896,6 @@ schedules.put('/workers/:id', authMiddleware, requireRole(['team_leader']), asyn
       return c.json({ error: 'Failed to update worker schedule', details: error.message }, 500)
     }
 
-    // Cache invalidation removed - cache.js was deleted as unused code
 
     return c.json({
       message: 'Worker schedule updated successfully',
