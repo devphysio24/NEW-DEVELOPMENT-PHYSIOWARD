@@ -1,0 +1,93 @@
+# Nginx Configuration for WorkReadines Backend
+# Place this file in: /etc/nginx/sites-available/workreadines-backend
+# Then create symlink: sudo ln -s /etc/nginx/sites-available/workreadines-backend /etc/nginx/sites-enabled/
+# Test config: sudo nginx -t
+# Reload: sudo systemctl reload nginx
+
+# Replace YOUR_DOMAIN_OR_IP with your actual domain or IP address
+# Replace YOUR_BACKEND_PORT with your backend port (default: 3000)
+
+server {
+    listen 80;
+    server_name YOUR_DOMAIN_OR_IP;  # Change this to your domain or IP
+
+    # Logging
+    access_log /var/log/nginx/workreadines-backend-access.log;
+    error_log /var/log/nginx/workreadines-backend-error.log;
+
+    # Increase body size for file uploads (adjust as needed)
+    client_max_body_size 50M;
+
+    # Proxy settings
+    location / {
+        proxy_pass http://localhost:3000;  # Change port if different
+        proxy_http_version 1.1;
+        
+        # Headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection '';
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # Buffering
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+
+    # Health check endpoint (optional, for monitoring)
+    location /health {
+        proxy_pass http://localhost:3000/health;
+        access_log off;
+    }
+}
+
+# SSL Configuration (uncomment after setting up SSL with Let's Encrypt)
+# server {
+#     listen 443 ssl http2;
+#     server_name YOUR_DOMAIN_OR_IP;
+# 
+#     ssl_certificate /etc/letsencrypt/live/YOUR_DOMAIN_OR_IP/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN_OR_IP/privkey.pem;
+#     ssl_protocols TLSv1.2 TLSv1.3;
+#     ssl_ciphers HIGH:!aNULL:!MD5;
+#     ssl_prefer_server_ciphers on;
+# 
+#     access_log /var/log/nginx/workreadines-backend-ssl-access.log;
+#     error_log /var/log/nginx/workreadines-backend-ssl-error.log;
+# 
+#     client_max_body_size 50M;
+# 
+#     location / {
+#         proxy_pass http://localhost:3000;
+#         proxy_http_version 1.1;
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#         proxy_set_header X-Forwarded-Proto $scheme;
+#         proxy_set_header Connection '';
+#         proxy_connect_timeout 60s;
+#         proxy_send_timeout 60s;
+#         proxy_read_timeout 60s;
+#         proxy_buffering off;
+#         proxy_request_buffering off;
+#     }
+# 
+#     location /health {
+#         proxy_pass http://localhost:3000/health;
+#         access_log off;
+#     }
+# }
+# 
+# # Redirect HTTP to HTTPS
+# server {
+#     listen 80;
+#     server_name YOUR_DOMAIN_OR_IP;
+#     return 301 https://$server_name$request_uri;
+# }
+
